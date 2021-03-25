@@ -1,0 +1,4187 @@
+$Library "wingdi.inc"
+
+Global Const VERSION As Float = 1.1
+
+' Export relevant constants
+$Export Const D*
+
+' $Export Types that need to be used by the application
+$Export Type D2Gradient "Use with D2BrushGradient"
+$Export Type DWRITE_HIT_TEST_METRICS "Use with TexLayout functions"
+$Export Type DWRITE_LINE_METRICS "Use with TexLayout functions"
+$Export Type DWRITE_TEXT_METRICS "Use with D2TL_Metrics()"
+$Export Type DWRITE_CLUSTER_METRICS "Use with D2TL_ClusterMetrics()"
+°$Export Type D2D1_STROKE_STYLE_PROPERTIES "Use with D2Stroke()"
+°$Export Type D2D1_POINT_2F "x-coordinate and y-coordinate pair"
+°$Export Type D2D1_SIZE_F "width and height of a rectangle"
+°$Export Type D2D1_ARC_SEGMENT "Use with D2Sink_AddArc"
+°$Export Type D2D1_BEZIER_SEGMENT "Use with D2Sink_AddBezier"
+°$Export Type D2D1_QUADRATIC_BEZIER_SEGMENT "Use with D2Sink_AddQuadraticBezier"
+°$Export Type D2D1_MATRIX_3X2_F "Use with D2Transform"
+$Export Type D2D1_*
+
+' Export variables for easy and fast access in the application.
+$Export Var D2ForeColor  "Defines foreground color for drawing"
+$Export Var D2BackColor  "Defines window background color for use with D2Clear"
+$Export Var D2BkColor    "Defines background color for drawing (used with D2Preset only)"
+$Export Var D2EndDrawError "Error state D2EndDraw"
+$Export Var D2DebugOff "Disables Assert in the D2Direct2D library"
+
+$Export Decl D2D1*
+
+' Globals used in this library
+'
+Global Bool D2DebugOff           ' dis/enabling of Asserts
+Global Long pD2CurRT            ' the current ID2D1RenderTarget
+Global Long D2EndDrawError       ' hold D2EndDraw() result (!= 0 is error)
+
+Global Long D2ForeColor, D2BkColor      ' drawing colors, D2BkColor is not used in Direct2D
+Global Long D2BackColor                 ' window background color, cannot be set, used as default for D2Clear
+
+Global Object D2StrokeStyle             ' the current ID2D1StrokeStyle, released in D2EndDraw
+Global D2D1StrokeWidth!                 ' the current line width, set in D2BeginDraw
+Global Object D2LineColorBrush          ' ColorBrush used for line drawing, set in BeginDraw
+Global Object D2DefFillBrush         ' the current ID2D1SolidColorBrush, ID2D1LinearGradientBrush, or ID2D1RadialGradientBrush
+Global Long pD2DefFillBrushRTOwner    ' references RenderTarget the D2DefFillBrush belongs to
+Global D2SaveMatrix As D2D1_MATRIX_3X2_F  ' to temporarily store a transformation matrix
+
+Global Object oIDWriteTextFormat ' the current IDWriteTextFormat (font/paragraph)
+
+Type RTOfDC : - Long hDc, pObj : EndType
+Global RTDC As String        ' if RT is DC save DC together with RT
+'Global IdxRTOfDC As Long
+
+Global Object oD2D1Factory       ' the ID2D1Factory object
+Global Object oWICImageFactory
+Global Object oDWriteFactory
+
+Function D2Version() As Float Naked
+  $Export Func D2Version "Returns a Single with the versionnumber for the GB Direct2D library"
+  D2Version = VERSION
+EndFunc
+
+$Group "RenderTarget"
+Function D2GetRT(Optional v As Variant, Optional width%, Optional height%) As Object     ' Returns a window or DC rendertarget
+  $Export Function D2GetRT "[frm | hWnd][,width%, height%] As Object" #10 _
+    "Returns and activates a rendertarget: by default a DC-rendertarget, specify a hWnd for a window-rendertarget."
+
+  Local hWnd As Handle, RTHwnd As Bool, rc As RECT, hDC As Handle
+
+  ' As of version 1.1 the syntax of D2GetRT changed from D2GetRT(frm, handle, w, h) to
+  ' D2GetRT( frm | hwnd, w, h). When the old syntax is used to create a window-RT, the
+  ' handle parameter must specify the window-handle. With the new syntax, that handle would
+  ' be passed through the width% parameter. Trap error when width% != 0 && height == 0 in
+  ' case the used syntax is D2GetRT([],hWnd):
+  If !D2DebugOff
+    Assert !(width% != 0 && height% == 0) ' wrong syntax, width% is a window handle?
+  EndIf
+
+'##E#
+  If IsMissing(v)
+    hDC = Me.hDC, hWnd = Me.hWnd
+  ElseIf IsObject(v)
+    hDC = v.hDC, hWnd = v.hWnd
+  ElseIf VarType(v) == basInt
+    hWnd = v, RTHwnd = True          ' hDC = 0
+  EndIf
+
+  If (width% == 0 || height% == 0) //&& hWnd
+    ~GetClientRect(hWnd, rc)
+    width% = rc.Right, height = rc.Bottom
+  EndIf
+
+  ' Create factories
+  If IsNothing(oD2D1Factory)
+    Local pfn As Long
+
+    ' Call D2D1CreateFactory in d2d1.dll
+    pfn = GetProcAddr("d2d1.dll", "D2D1CreateFactory")
+    If pfn _
+      ~StdCall(pfn)(D2D1_FACTORY_TYPE_SINGLE_THREADED, IID_ID2D1Factory, 0, V:oD2D1Factory)
+    Assert !IsNothing(oD2D1Factory) ' D2D1CreateFactory: Could not create IID_ID2D1_FACTORY
+
+    ' Call CoCreateInstance in ole32.dll
+    pfn = GetProcAddr("ole32.dll", "CoCreateInstance")
+    If pfn _
+      ~StdCall(pfn)(CLSID_WICImagingFactory, 0, CLSCTX_ALL, IID_IWICImagingFactory, V:oWICImageFactory)
+    Assert !IsNothing(oWICImageFactory) ' CoCreateInstance: Could not create CLSID_WICImagingFactory
+
+    ' Call DwriteCreateFactory in dwrite.dll
+    pfn = GetProcAddr("dwrite.dll", "DWriteCreateFactory")
+    If pfn _
+      ~StdCall(pfn)(DWRITE_FACTORY_TYPE_SHARED, IID_IDWriteFactory, V:oDWriteFactory)
+    Assert !IsNothing(oDWriteFactory) ' DWriteCreateFactory: Could not create IID_IWriteFactory
+
+  EndIf
+
+  Dim pixelFormat As D2D1_PIXEL_FORMAT
+  If RTHwnd         ' Window RenderTarget
+    pixelFormat.format = DXGI_FORMAT_UNKNOWN
+    pixelFormat.alphaMode = D2D1_ALPHA_MODE_UNKNOWN
+  Else              ' DC RenderTarget
+    pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM
+    pixelFormat.alphaMode = D2D1_ALPHA_MODE_IGNORE
+  EndIf
+
+  Dim renderTargetProperties As D2D1_RENDER_TARGET_PROPERTIES
+  renderTargetProperties.type = D2D1_RENDER_TARGET_TYPE_DEFAULT  ' Hardware acceleration if possible
+  renderTargetProperties.pixelFormat = pixelFormat
+  ' dpiX and dpiY are 0.0 by default, taking system DPI (main screen)
+  ' However, window can be on high-dpi display (app must be dpi-aware)
+  //If hWnd
+  Local Float Dpi = WinDpi(hWnd)      ' call helper function
+  renderTargetProperties.dpiX = Dpi
+  renderTargetProperties.dpiY = Dpi
+  //EndIf
+
+  renderTargetProperties.usage = D2D1_RENDER_TARGET_USAGE_NONE
+  renderTargetProperties.minLevel = D2D1_FEATURE_LEVEL_DEFAULT
+
+  ' We're going to store an object ref in D2CurRT Object,
+  ' make sure it is empty, otherwise it will never be released.
+  ''  If !IsNothing(D2CurRT) Then Set D2CurRT = Nothing
+  If RTHwnd       ' Create a window rendertarget
+    Dim hwndRenderTargetProperties As D2D1_HWND_RENDER_TARGET_PROPERTIES
+    hwndRenderTargetProperties.hwnd = /*h*/ hWnd
+    hwndRenderTargetProperties.pixelSize.width = width
+    hwndRenderTargetProperties.pixelSize.height = height
+    hwndRenderTargetProperties.presentOptions = D2D1_PRESENT_OPTIONS_NONE
+
+    ' oD2D1Factory.CreateHwndRenderTarget
+    ~StdCall({{{V:oD2D1Factory}} + OffsetOf(ID2D1FactoryVtbl.CreateHwndRenderTarget)})({V:oD2D1Factory}, _
+      V:renderTargetProperties, V:hwndRenderTargetProperties, V:D2GetRT)
+    pD2CurRT = {V:D2GetRT}
+
+  Else   ' Create a DC rendertarget
+    ' oD2D1Factory.CreateDCRenderTarget
+    If StdCall({{{V:oD2D1Factory}} + OffsetOf(ID2D1FactoryVtbl.CreateDCRenderTarget)})({V:oD2D1Factory}, _
+      V:renderTargetProperties, V:D2GetRT) == S_OK
+      pD2CurRT = {V:D2GetRT}
+      rc.Right = width
+      rc.Bottom = height
+      '''  D2DCRT_BindDC(oRT, h, rc)
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1DCRenderTargetVtbl.BindDC)})(pD2CurRT, _
+        hDC, V:rc)
+
+      ' Store RT with DC-handle (keep together) to be used in D2ResizeRT
+      Dim r As RTOfDC
+      r.hDc = hDC, r.pObj = pD2CurRT
+      RTDC = RTDC + Peek$(V:r, SizeOf(RTOfDC))
+    EndIf
+  EndIf
+
+  ~InvalidateRect(hWnd, 0, 0)
+
+  'Set D2GetRT = D2CurRT   ' Set return value
+  'pD2CurRT = pD2CurRT
+  ' Make sure there is a font present
+  If IsNothing(oIDWriteTextFormat) Then D2SetFont DEFAULT_GUI_FONT
+
+EndFunc
+
+>Proc D2SetRT(RT As Object) Naked
+  $Export Proc D2SetRT "RT - Activates the specified render target"
+
+  // Assert IsTypeOfObject(RT, IID_ID2D1RenderTarget) ' param not a render target
+  ''Set D2CurRT = RT
+  pD2CurRT = {V:RT}
+EndProc
+
+'Proc D2BeginDraw(Optional vRT As Variant)   ' D2BeginDraw [objRT]
+>Proc D2GetSizeRT(RT As Object, ByRef width!, ByRef height!, Optional Pixels As Boolean) Naked
+  $Export Proc D2GetSizeRT "RT, width!, height! [,Pixels as Bool]" #10 _
+    " Default: Obtains the size of the render target in device independent pixels (Dips). " _
+    "Set Pixels = True to obtain the size in physical pixels."
+
+  Dim sizef As D2D1_SIZE_F, size As D2D1_SIZE_U
+  width! = 0, height! = 0
+  If !IsNothing(RT)
+    If !D2DebugOff
+      Assert IsTypeOfObject(RT, IID_ID2D1RenderTarget) ' RT not a render target
+    EndIf
+
+    If Pixels
+      ~StdCall({{{V:RT}} + OffsetOf(ID2D1RenderTargetVtbl.GetPixelSize)})({V:RT}, V:size)
+      width! = size.width, height! = size.height
+    Else
+      ~StdCall({{{V:RT}} + OffsetOf(ID2D1RenderTargetVtbl.GetSize)})({V:RT}, V:sizef)
+      width! = sizef.width, height! = sizef.height
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2GetDpiRT(RT As Object, ByRef dpiX As Float, ByRef dpiY As Float) Naked
+  $Export Proc D2GetDpiRT "RT, dpiX, dpiY" #10 _
+    "Returns the render target's DPI in dpiX and dpiY."
+
+  If !IsNothing(RT)
+    If !D2DebugOff
+      Assert IsTypeOfObject(RT, IID_ID2D1RenderTarget) ' RT not a render target
+    EndIf
+
+    ~StdCall({{{V:RT}} + OffsetOf(ID2D1RenderTargetVtbl.GetDpi)})({V:RT}, V:dpiX, V:dpiY)
+  EndIf
+EndProc
+
+>Proc D2SetDpiRT(RT As Object, dpiX As Float, Optional dpiY As Float) Naked
+  $Export Proc D2SetDpiRT "RT, dpiX [, dpiY]" #10 _
+    "Sets the render target's DPI. Parameter dpiY not used."
+
+  If !IsNothing(RT)
+    If !D2DebugOff
+      Assert IsTypeOfObject(RT, IID_ID2D1RenderTarget) ' RT not a render target
+    EndIf
+    ~StdCall({{{V:RT}} + OffsetOf(ID2D1RenderTargetVtbl.SetDpi)})({V:RT}, Sgl:dpiX, Sgl:dpiX)
+  EndIf
+EndProc
+
+>Proc D2AntiAlias(ByVal fOn As Bool, Optional What% = D2AA_FIGURES | D2AA_TEXT) Naked
+  $Export Proc D2AntiAlias "fOn? [,What%]" #10 _
+    "Enables/Disables rendertarget's antialiasing for (by default both) figures and text (by default RT uses antialiasing)."
+  Global Enum D2AA_FIGURES = 1, D2AA_TEXT = 2
+  Local m%
+  If pD2CurRT
+    If What% %& D2AA_FIGURES
+      m% = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE    ' =0
+      If fOn == False Then m% = D2D1_ANTIALIAS_MODE_ALIASED
+      . push m%                 ; push argument
+      . mov eax, pD2CurRT       ; get  object's addr
+      . push eax                ; push  object's addr
+      . mov eax, dpt [ eax]     ; get vtable addr
+      . mov eax, dpt[ eax + OffsetOf(ID2D1RenderTargetVtbl.SetAntialiasMode)] ; get SetAntiAliasMode function addr
+      . call eax                ; call
+
+      °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.SetAntialiasMode)})(pD2CurRT, _
+        fOn ? D2D1_ANTIALIAS_MODE_PER_PRIMITIVE : D2D1_ANTIALIAS_MODE_ALIASED)
+    EndIf
+    If What% %& D2AA_TEXT
+      m% = D2D1_TEXT_ANTIALIAS_MODE_DEFAULT     ' =0
+      If fOn == False Then m% = D2D1_TEXT_ANTIALIAS_MODE_ALIASED
+      . push m%                 ; push argument
+      . mov eax, pD2CurRT       ; get  object's addr
+      . push eax                ; push  object's addr
+      . mov eax, dpt [ eax]     ; get vtable addr
+      . mov eax, dpt [ eax + OffsetOf(ID2D1RenderTargetVtbl.SetTextAntialiasMode)] ; get SetTextAntiAliasMode function addr
+      . call eax                ; call
+
+      °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.SetTextAntialiasMode)})(pD2CurRT, _
+        fOn ? D2D1_TEXT_ANTIALIAS_MODE_DEFAULT : D2D1_TEXT_ANTIALIAS_MODE_ALIASED)
+    EndIf
+
+  EndIf
+EndProc
+>Function D2PixelsToDIP(ByVal pixels As Float) As Float Naked
+  $Export Function D2PixelsToDIP "(pixels As Float) As Float" #10 _
+    "Converts pixels to DIP for the current render target or " _
+    "Me when missing an active render target."
+
+  Local Float dpiX, dpiY
+
+  If pD2CurRT
+    °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetDpi)})(pD2CurRT, V:dpiX, V:dpiY)
+    ' Use asm to skip the overhead of StdCall, improves performance only a little,
+    ' but is welcomed for this function that executes often and reads DPI values over and over.
+    ' For most other StdCalls the improvement - compared to the
+    ' execution time of the method itself - is nihil (not measurable).
+    . lea eax, dpiY
+    . push eax                ; push V:dpiX
+    . lea eax, dpiX
+    . push eax                ; push V:dpiX
+    . mov eax, pD2CurRT       ; get object's addr
+    . push eax                ; push  object's addr
+    . mov eax, dpt [ eax]     ; get vtable addr
+    . mov eax, dpt [ eax+OffsetOf(ID2D1RenderTargetVtbl.GetDpi)] ; get GetDpi function addr
+    . call eax                ; call GetDpi directly
+
+  Else    ' no render target, use Me's dpi
+    dpiX = WinDpi(Me.hWnd)
+  EndIf
+  D2PixelsToDIP = pixels / (dpiX / 96)
+
+EndFunc
+
+>Function D2DIPsToPixel(ByVal DIP As Float) As Float Naked
+  $Export Function D2DIPsToPixel "(DIP As Float) As Float" #10 _
+    "Converts DIP to pixels for the current render target or " _
+    "Me when missing an active render target."
+
+  Local Float dpiX, dpiY
+
+  If pD2CurRT
+    °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetDpi)})(pD2CurRT, V:dpiX, V:dpiY)
+    ' Use asm to skip the overhead of StdCall, improves performance only a little,
+    ' but is welcomed for this function that executes often and reads DPI values over and over.
+    ' For most other StdCalls the improvement - compared to the
+    ' execution time of the method itself - is nihil (not measurable).
+    . lea eax, dpiY
+    . push eax                ; push V:dpiX
+    . lea eax, dpiX
+    . push eax                ; push V:dpiX
+    . mov eax, pD2CurRT       ; get object's addr
+    . push eax                ; push  object's addr
+    . mov eax, dpt [ eax]     ; get vtable addr
+    . mov eax, dpt [ eax + OffsetOf(ID2D1RenderTargetVtbl.GetDpi)] ; get GetDpi function addr
+    . call eax                ; call GetDpi directly
+
+  Else    ' no render target, use Me's dpi
+    dpiX = WinDpi(Me.hWnd)
+  EndIf
+  D2DIPsToPixel = DIP * (dpiX / 96)
+
+EndFunc
+
+Proc D2AdjustW(ByVal frm As Form, ByVal wDIP!, ByVal hDIP!)
+  $Export Proc D2AdjustW "frm, wDIP!, hDIP!" #10 _
+    " Adjusts the size of the window (form) based on the required" #10 _
+    "client size in DIPs. Takes menubar into account, but not toolbar and statusbar."
+
+  Dim rc As RECT, hWnd As Handle = frm.hWnd
+  Local Long Dpi = WinDpi(hWnd)
+  rc.Right = wDIP! * (Dpi / 96)    ' size in pixels for new DPI
+  rc.Bottom = hDIP! * (Dpi / 96)   ' size in pixels for new DPI
+
+  ' AdjustWindowRectExForDpi calculates correct value for window size.
+
+  Static Long pfn = GetProcAddress(GetModuleHandle("user32.dll"), "AdjustWindowRectExForDpi")
+  If pfn
+    ~StdCall(pfn)(*rc, GetWindowLong(hWnd, GWL_STYLE), _
+      GetMenu(hWnd) != 0 ? 1 : 0, GetWindowLong(hWnd, GWL_EXSTYLE), Dpi)
+
+    ~SetWindowPos(hWnd, 0, 0, 0, rc.Right - rc.Left, rc.Bottom - rc.Top, SWP_NOMOVE | SWP_NOZORDER)
+  EndIf
+EndProc
+
+>Proc D2ResizeRT(ByVal RT As Object, width%, height%)
+  $Export Proc D2ResizeRT "RT, width%, height%" #10 _
+    "Resizes the render target's surface to the specified pixels."
+
+  If !IsNothing(RT)
+    If IsTypeOfObject(RT, IID_ID2D1HwndRenderTarget)
+      Dim size As D2D1_SIZE_U
+      °If width == 0 || height == 0
+      °size.width = _X, size.height = _Y
+      °Else
+      size.width = width, size.height = height
+      °EndIf
+      ~StdCall({{{V:RT}} + OffsetOf(ID2D1HwndRenderTargetVtbl.Resize)})({V:RT}, _
+        V:size)
+
+    ElseIf IsTypeOfObject(RT, IID_ID2D1DCRenderTarget)
+      Dim rc As RECT
+      °If width == 0 || height == 0
+      °rc.Right = _X, rc.Bottom = _Y
+      °Else
+      rc.Right = width , rc.Bottom = height
+      °EndIf
+
+      ' Find the DC handle from RT
+      Local i As Long, hdc As Handle, r As Pointer RTOfDC
+      For i = 0 To (Len(RTDC) \ SizeOf(RTOfDC)) - 1
+        Pointer r = V:RTDC + i * SizeOf(RTOfDC)
+        If r.pObj == {V:RT}
+          hdc = r.hDc
+          Exit For
+        EndIf
+      Next
+
+      °For i = 0 To UBound(RTOfDC())
+      °If RTOfDC(i).pObj == {V:RT}
+      °hdc = RTOfDC(i).hDc
+      °Exit For
+      °EndIf
+      °Next
+      Assert hdc != 0
+      ~StdCall({{{V:RT}} + OffsetOf(ID2D1DCRenderTargetVtbl.BindDC)})({V:RT}, _
+        hdc, V:rc)
+    EndIf
+  EndIf
+
+EndProc
+
+'
+$Group "Geometry"
+>Function D2PathGeometry() As Object Naked
+  $Export Function D2PathGeometry "D2PathGeometry() As Object" #10 _
+    "Returns a path geometry object: Set obj = D2PathGeometry()"
+
+  If !D2DebugOff
+    Assert !IsNothing(oD2D1Factory) ' Drect2D not initialized (use D2GetRT first)
+  EndIf
+  ~StdCall({{{V:oD2D1Factory}} + OffsetOf(ID2D1FactoryVtbl.CreatePathGeometry)})({V:oD2D1Factory}, _
+    V:D2PathGeometry)
+
+EndFunc
+
+>Function D2GeometrySink(Geometry As Object, Optional fFillWinding?) As Object Naked
+  $Export Function D2GeometrySink "(objGeometry [,fFillWinding?]) As Object" #10 _
+    "Returns a geometry sink object for drawing; calls Open method on a Geometry object. " _
+    "Optionally, set fFillWinding to True to set the sink's fill mode to winding."
+  Local Sink As Object
+  If !IsNothing(Geometry)
+    If !D2DebugOff
+      Assert IsTypeOfObject(Geometry, IID_ID2D1Geometry) ' param not a D2Geometry
+    EndIf
+    ~StdCall({{{V:Geometry}} + OffsetOf(ID2D1PathGeometryVtbl.Open)})({V:Geometry}, _
+      V:Sink)
+    If fFillWinding?
+      D2Sink_FillMode(Sink, D2D1_FILL_MODE_WINDING)
+    EndIf
+    Set D2GeometrySink = Sink
+  EndIf
+EndFunc
+
+>Proc D2Sink_FillMode(Sink As Object, fillMode%) Naked
+  $Export Proc D2Sink_FillMode "objGeoSink, fillMode%" #10 _
+    "Specifies the method used to determine which points are inside the geometry and which points are outside." #10 _
+    "Possible values: D2D1_FILL_MODE_ALTERNATE (0), D2D1_FILL_MODE_WINDING (1)." #10 _
+    "Call D2Sink_FillMode before the first call to D2Sink_BeginFigure."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.SetFillMode)})({V:Sink}, fillMode%)
+EndProc
+
+>Proc D2Sink_BeginFigure(Sink As Object, x0!, y0!, Optional figureBegin%) Naked
+  $Export Proc D2Sink_BeginFigure "objGeoSink, x0!, y0! [, figureBegin%]" #10 _
+    "Starts a new (default filled) figure at the specified point, set figureBegin% to D2D1_FIGURE_BEGIN_HOLLOW (1) to prevent filling."
+  Local startPoint As D2D1_POINT_2F
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  startPoint.x = x0!, startPoint.y = y0!
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.BeginFigure)})({V:Sink}, _
+    Sng: startPoint.x, Sng: startPoint.y, figureBegin%)
+EndProc
+
+>Proc D2Sink_EndFigure(Sink As Object, Optional figureEnd%) Naked
+  $Export Proc D2Sink_EndFigure "objGeoSink [,figureEnd%]" #10 _
+    "Ends the current figure; optionally set figureEnd% to D2D1_FIGURE_END_CLOSED (1) to close the figure by connecting last and first point."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.EndFigure)})({V:Sink}, figureEnd%)
+EndProc
+
+>Proc D2Sink_Close(Sink As Object) Naked
+  $Export Proc D2Sink_Close "objGeoSink" #10 _
+    "Closes the sink after finishing creating figures. The Sink object is no longer usable."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.Close)})({V:Sink})
+EndProc
+
+>Proc D2Sink_AddArc(Sink As Object, ByRef arc As D2D1_ARC_SEGMENT) Naked
+  $Export Proc D2Sink_AddArc "objGeoSink, arcSegment" #10 _
+    "Adds a single arc to the geometry-sink object."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddArc)})({V:Sink}, V:arc)
+EndProc
+
+>Proc D2Sink_AddLine(Sink As Object, ByRef pnt As D2D1_POINT_2F) Naked
+  $Export Proc D2Sink_AddLine "objGeoSink, point2F" #10 _
+    "Adds a line from the current position to position in point2F (of type D2D1_POINT_2F)."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddLine)})({V:Sink}, Sgl:pnt.x, Sgl:pnt.y)
+EndProc
+
+>Proc D2Sink_AddLines(Sink As Object, ByRef points() As D2D1_POINT_2F, pointsCount%) Naked
+  $Export Proc D2Sink_AddLines "objGeoSink, points(), pointsCount%" #10 _
+    "Adds lines from the points() array of type D2D1_POINT_2F to the sink object."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddLines)})({V:Sink}, ArrayAddr(points()), pointsCount%)
+EndProc
+
+>Proc D2Sink_AddBezier(Sink As Object, ByRef bezier As D2D1_BEZIER_SEGMENT) Naked
+  $Export Proc D2Sink_AddBezier "objGeoSink, bezier" #10 _
+    "Creates a cubic Bezier curve defined in a D2D1_BEZIER_SEGMENT type."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddBezier)})({V:Sink}, V:bezier)
+EndProc
+
+>Proc D2Sink_AddBeziers(Sink As Object, ByRef bezier() As D2D1_BEZIER_SEGMENT, bezierCount%) Naked
+  $Export Proc D2Sink_AddBeziers "objGeoSink, bezier(), Count%" #10 _
+    "Creates a sequence of cubic Bezier curves defined in a D2D1_BEZIER_SEGMENT array and adds them to the geometry sink."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddBeziers)})({V:Sink}, ArrayAddr(bezier()), bezierCount%)
+EndProc
+
+>Proc D2Sink_AddQuadraticBezier(Sink As Object, ByRef bezier As D2D1_QUADRATIC_BEZIER_SEGMENT) Naked
+  $Export Proc D2Sink_AddQuadraticBezier "objGeoSink, bezier" #10 _
+    "Creates a quadratic Bezier curve defined in a D2D1_QUADRATIC_BEZIER_SEGMENT type."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.AddQuadraticBezier)})({V:Sink}, V:bezier)
+EndProc
+
+>Proc D2Sink_SegmentFlags(Sink As Object, vertexFlags%) Naked
+  $Export Proc D2Sink_SegmentFlags "objGeoSink, vertexFlags%" #10 _
+    "Specifies stroke and join options to be applied to new segments added to the geometry sink."
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(Sink, IID_ID2D1GeometrySink) ' param not a D2GeometrySink
+  EndIf
+  ~StdCall({{{V:Sink}} + OffsetOf(ID2D1GeometrySinkVtbl.SetSegmentFlags)})({V:Sink}, vertexFlags%)
+EndProc
+
+>Proc D2FillGeometry(Geometry As Object, Optional D2Brush As Object, Optional opacityD2Brush As Object) Naked
+  $Export Proc D2FillGeometry "objGeometry [, D2BrushFill][, opacityD2Brush]" #10 _
+    "Draws a filled geometry using the specified D2BrushFill or current brush set with D2DefFill."
+  Local Int pBrush
+  If pD2CurRT //&& !IsNothing(Geometry)
+    If !D2DebugOff
+      Assert IsTypeOfObject(Geometry, IID_ID2D1Geometry) ' param 1 not a D2Geometry
+    EndIf
+
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param 2 not a D2Brush
+      EndIf
+      pBrush = {V:D2Brush}
+    Else
+      If IsNothing(D2DefFillBrush) Then D2DefFill D2ForeColor    ' brush from current color
+      If !D2DebugOff
+        Assert pD2DefFillBrushRTOwner == pD2CurRT ' Current brush not owned by rendertarget, use D2DefFill first
+      EndIf
+      pBrush = {V:D2DefFillBrush}
+    EndIf
+    If !IsNothing(opacityD2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(opacityD2Brush, IID_ID2D1Brush) ' param 3 not a D2Brush
+      EndIf
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.FillGeometry)})(pD2CurRT, _
+      {V:Geometry}, pBrush, {V:opacityD2Brush})
+
+  EndIf
+EndProc
+
+>Proc D2DrawGeometry(Geometry As Object, Optional D2Brush As Object) Naked
+  $Export Proc D2DrawGeometry "objGeometry [, D2BrushPen]" #10 _
+    "Draws the lines of a geometry object using line style and width set with D2DefLine and" #10 _
+    "a solid color brush or the optional D2Brush."
+
+  Local pbrPenCol As Int
+
+  If pD2CurRT ' Not a current render target, use D2SetRT
+    If !D2DebugOff
+      Assert IsTypeOfObject(Geometry, IID_ID2D1Geometry) ' param 1 not a D2Geometry
+    EndIf
+
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param 2 not a D2Brush
+      EndIf
+      pbrPenCol = {V:D2Brush}
+    Else                      ' create penbrush from D2Forecolor
+      D2SetLineColBrush
+      pbrPenCol = {V:D2LineColorBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawGeometry)})(pD2CurRT, _
+      {V:Geometry}, pbrPenCol, Sgl:D2D1StrokeWidth! , {V:D2StrokeStyle})
+
+  EndIf
+EndProc
+
+'
+$Group "Bitmaps"
+>Function D2Bitmap(ByVal param As Variant) As Object
+  $Export Function D2Bitmap "(hBmp | filename$) As Object" #10 _
+    "Creates a Direct2D bitmap (ID2D1Bitmap) from a GDI bitmap handle" #10 _
+    "or an image file (or a :Files resource)." #10 "Usage: Set bmp = D2Bitmap(hBmp | filename$)"
+
+  Local IWICBitmap As Object
+  Local IWICFormatConverter As Object
+  Local IWICBitmapDecoder As Object
+  Local IWICBitmapFrameDecode As Object
+  Local hr As Long, hBmp As Handle
+  Local alphath As Double = 0.0
+
+  If !D2DebugOff
+    Assert pD2CurRT ' D2 not intialized? Use D2GetRT or D2SetRT
+  EndIf
+
+  If VarType(param) = basInt  // assume it is a GDI bitmap handle
+    hBmp = param
+
+    // Create an IWICBitmap from a bitmap handle.
+    // Call IWICImagingFactory::CreateBitmapFromHBITMAP method
+    hr = StdCall({{{V:oWICImageFactory}} + OffsetOf(IWICImagingFactoryVtbl.CreateBitmapFromHBITMAP)})({V:oWICImageFactory}, _
+      hBmp, 0, WICBitmapIgnoreAlpha, V:IWICBitmap)
+
+    // Create a new instance of the IWICFormatConverter class.
+    // Call IWICImagingFactory::CreateFormatConverter method
+    If hr == S_OK _
+      hr = StdCall({{{V:oWICImageFactory}} + OffsetOf(IWICImagingFactoryVtbl.CreateFormatConverter)})({V:oWICImageFactory}, _
+      V:IWICFormatConverter)
+
+    // Initialize the format converter and perform the conversion.
+    // Call IWICFormatConverter::Initialize method
+    If hr == S_OK _
+      hr = StdCall({{{V:IWICFormatConverter}} + OffsetOf(IWICFormatConverterVtbl.Initialize)})({V:IWICFormatConverter}, _
+      {V:IWICBitmap}, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, 0, _
+      {V:alphath}, {V:alphath + 4}, WICBitmapPaletteTypeCustom)
+
+
+  Else If VarType(param) == basVString
+    Local pathTmpFile As String, fKillFile As Boolean
+    Local sfile As String = param
+    Assert Exist(sfile) ' File does not exist
+
+    If Left(sfile) == ":"
+      pathTmpFile = TempFileName("")
+      CopyFile sfile Over To pathTmpFile
+      fKillFile = True             ' Kill after loading
+      sfile = pathTmpFile
+    EndIf
+    Dim vFile As Variant = sfile   ' do not reuse param Variant: access violation
+
+
+    ' ---------------------------------------------------------------------
+    ' BUG? Calling another lib-func from a lib doesn't work?
+    '    sfile = Wide(sfile)  ' obtain wide string with filename
+    ' => Seems to be Variant related
+    ' Workaround: use {V:param + 8} directly for the wide str parameter
+    ' ---------------------------------------------------------------------
+
+    // Create an IWICBitmapDecoder by using the
+    // ICImagingFactory::CreateDecoderFromFileName method.
+
+    hr = StdCall({{{V:oWICImageFactory}} + OffsetOf(IWICImagingFactoryVtbl.CreateDecoderFromFilename)})({V:oWICImageFactory}, _
+      {V:vFile + 8}, 0, GENERIC_READ, WICDecodeMetadataCacheOnLoad, V:IWICBitmapDecoder)
+
+    If fKillFile Then KillTempFile pathTmpFile
+
+    // Retrieve first frame from the image and store the frame in an IWICBitmapFrameDecode object.
+    // Call IWICBitmapDecoder::GetFrame method
+    If hr == S_OK _
+      hr = StdCall({{{V:IWICBitmapDecoder}} + OffsetOf(IWICBitmapDecoderVtbl.GetFrame)})({V:IWICBitmapDecoder}, _
+      0, V:IWICBitmapFrameDecode)
+
+    // Create a new instance of the IWICFormatConverter class.
+    // Call IWICImagingFactory::CreateFormatConverter method
+    If hr == S_OK _
+      hr = StdCall({{{V:oWICImageFactory}} + OffsetOf(IWICImagingFactoryVtbl.CreateFormatConverter)})({V:oWICImageFactory}, _
+      V:IWICFormatConverter)
+
+    // Initialize the format converter and perform the conversion
+    // Call IWICFormatConverter::Initialize method
+    If hr == S_OK _
+      hr = StdCall({{{V:IWICFormatConverter}} + OffsetOf(IWICFormatConverterVtbl.Initialize)})({V:IWICFormatConverter}, _
+      {V:IWICBitmapFrameDecode}, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, 0, _
+      {V:alphath}, {V:alphath + 4}, WICBitmapPaletteTypeMedianCut)
+  EndIf
+
+  // Create a ID2D1Bitmap from the WIC bitmap.
+  If hr == S_OK
+    '''    D2RT_CreateBitmapFromWicBitmap(D2CurRT, IWICFormatConverter, 0, D2Bitmap)
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateBitmapFromWicBitmap)})(pD2CurRT, _
+      {V:IWICFormatConverter}, 0, V:D2Bitmap)
+  EndIf
+
+EndFunc
+
+>Proc D2BitmapSize(D2Bitmap As Object, ByRef w!, ByRef h!, Optional Pixels As Boolean) Naked
+  $Export Proc D2BitmapSize "D2Bitmap, width!, height! [,Pixels?]" #10 _
+    "Returns the size, in device-independent pixels (DIPs), of the bitmap " _
+    "in the variables width! and height!. Returns size in pixels when Pixels? = True."
+
+  Local sizef As D2D1_SIZE_F, sizeu As D2D1_SIZE_U
+  w! = 0, h! = 0
+  If !IsNothing(D2Bitmap)
+    If !D2DebugOff
+      Assert IsTypeOfObject(D2Bitmap, IID_ID2D1Bitmap) ' param not a D2Bitmap
+    EndIf
+    If Pixels
+      ~StdCall({{{V:D2Bitmap}} + OffsetOf(ID2D1BitmapVtbl.GetPixelSize)})({V:D2Bitmap}, V:sizeu)
+      w! = sizeu.width, h! = sizeu.height
+    Else
+      ~StdCall({{{V:D2Bitmap}} + OffsetOf(ID2D1BitmapVtbl.GetSize)})({V:D2Bitmap}, V:sizef)
+      w! = sizef.width, h! = sizef.height
+    EndIf
+  EndIf
+
+EndProc
+
+>Proc D2Put(x As Float, y As Float, ByVal D2Bitmap As Object, Optional ww As Float, Optional hh As Float, _
+  Optional Opacity As Float = 1, _
+  Optional sx As Float, Optional sy As Float, Optional sw As Float, Optional sh As Float, _
+  Optional interpolationMode% = -1)
+  Local size As D2D1_SIZE_F, rcf As D2D1_RECT_F, srcf As D2D1_RECT_F, psrcf As Long
+  $Export Proc D2Put "x!,y!,D2Bitmap [,ww!,hh!][,Opacity!][,sx!,sy!,sw!,sh!][,interpolationMode%]" #10 _
+    "Draws a D2Bitmap on the render target at x,y. " _
+    "Optionally: set output size ww, hh, and optionally copy from source position sx,sy and size sw, sh. " _
+    "Optional: interpolationMode (used to override default = RT's antialiasmode)."
+
+  If pD2CurRT
+    If !D2DebugOff
+      Assert IsTypeOfObject(D2Bitmap, IID_ID2D1Bitmap) ' param not a D2Bitmap
+    EndIf
+
+    // Set the destination rectangle
+    rcf.left = x, rcf.top = y
+    If (ww == 0.0!) || (hh == 0.0!)   ' Retrieve the size of the bitmap.
+      ~StdCall({{{V:D2Bitmap}} + OffsetOf(ID2D1BitmapVtbl.GetSize)})({V:D2Bitmap}, V:size)
+      rcf.right = x + size.width
+      rcf.bottom = y + size.height
+    Else                          ' use passed width and height
+      rcf.right = x + ww
+      rcf.bottom = y + hh
+    EndIf
+    // Set the source rectangle if sw and sh values are specified
+    If !(sw == 0.0! || sh == 0.0!)
+      srcf.left = sx
+      srcf.top = sy
+      srcf.right = sx + sw
+      srcf.bottom = sy + sh
+      psrcf = V:srcf
+    EndIf
+
+    If interpolationMode% == -1         ' default: use RT's antialias setting
+      If StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetAntialiasMode)})(pD2CurRT) == D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+        interpolationMode% = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+      Else
+        interpolationMode% = D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+      EndIf
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawBitmap)})(pD2CurRT, _
+      {V:D2Bitmap}, V:rcf, Sgl:Opacity, interpolationMode%, psrcf)
+  EndIf
+
+EndProc
+'
+$Group "Transform"
+>Proc D2TransformAdd(mode%, Optional p0!, Optional p1!, Optional p2!, Optional p3!) Naked
+  $Export Proc D2TransformAdd "mode%[,p0!],[p1!][,p2!],[p3!]" #10 _
+    "Adds the specified transformation to the current. Possible modes:" #10 _
+    "D2TF_ROTATE, angle, centerX, centerY - Rotates around centrX, centerY" #10 _
+    "D2TF_SKEW, angleX, angleY, centerX, centerY - Skews from centerX, centrY using angles" #10 _
+    "D2TF_SCALE, scaleX, scaleY, centerX, centerY - Scales from centerX, centrY with scaleX and scaleY" #10 _
+    "D2TF_MOVE, moveX, moveY - Moves over moveX, moveY units" #10 _
+    "D2TF_INVERT - Inverts current tansformation"
+  If mode% > D2TF_OFF && mode% <= D2TF_INVERT _
+    D2Transform mode% %| D2TF_ADD, p0!, p1!, p2!, p3!
+EndProc
+
+>Proc D2TransformOffset(xOff!, yOff!, Optional fAdd?) Naked
+  $Export Proc D2TransformOffset "xOff!, yOff! [,fAdd?]" #10 _
+    "Sets the origin to (xOff, yOff) or adds (fAdd?=True) the offset to the current transformation. Wrapper for D2Transform(D2TF_MOVE, xOff, yOff)."
+  D2Transform D2TF_MOVE + (fAdd ? D2TF_ADD : 0), xOff!, yOff!
+EndProc
+
+Proc D2Transform(Optional mode%, Optional p0!, Optional p1!, Optional p2!, Optional p3!) Naked
+  $Export Proc D2Transform "[mode%][,p0!],[p1!][,p2!],[p3!]" #10 _
+    "Sets the transform for drawing. mode%:" #10 _
+    "address of D2D1_MATRIX_3X2_F variable or:" #10 _
+    "D2TF_OFF - (or omit mode%) Disables"  #10 _
+    "D2TF_ROTATE, angle, cX, cY - Rotates around cX, cY" #10 _
+    "D2TF_SKEW, angleX, angleY, cX, cY - Skews from cX, cY using angles" #10 _
+    "D2TF_SCALE, sX, sY, cX, cY - Scales from cX, cY with sX and sY" #10 _
+    "D2TF_MOVE, X, Y - Moves over x,y units " #10 _
+    "D2TF_INVERT - Inverts current transform" #10 _
+    "Combine with D2TF_ADD to add a new transformation to the current setting or use D2TransFormAdd."
+
+  Global Enum D2TF_OFF, D2TF_ROTATE, D2TF_SKEW, D2TF_SCALE, D2TF_MOVE, D2TF_INVERT, D2TF_ADD=8
+
+  ' D2Transform [0] - Disables transforming
+  ' D2Transform 1 [+8], angle, cx, cy - Rotates around cx, cy with angle
+  ' D2Transform 2 [+8], angleX, angleY, cx, cy - Skews from cx, cy with angles
+  ' D2Transform 3 [+8], scalex, scaley, cx, cy - Scales object from cx, cy
+  ' D2Transform 4 [+8], x, y - Translates (moves) object over x and y units
+  ' D2Transform 5 - Inverts the current transform matrix
+
+  Local matrix As D2D1_MATRIX_3X2_F, center As D2D1_POINT_2F, tmp As Large
+  Local a As D2D1_MATRIX_3X2_F, b As D2D1_MATRIX_3X2_F
+
+  If pD2CurRT
+    If mode% %& 0xFFFFFFF0      ' address of a matrix
+      MemCpy V:matrix, mode%, SizeOf(D2D1_MATRIX_3X2_F)
+
+    Else
+      Switch mode% %& 7
+      Case 0  ' Reset transform
+        matrix.f11 = 1.0     ' create Identity matrix
+        matrix.f22 = 1.0
+
+      Case 1  ' Set Rotation
+        °Static Long pfnD2D1MakeRotateMatrix = GetProcAddress(GetModuleHandle("d2d1.dll"), "D2D1MakeRotateMatrix")
+        °
+        ' p0 = angle, p1 = x-coord, p2 = y-coord,
+        °center.x = p1!, center.y = p2!      ' center of rotation
+        °Large{V:tmp} = Large{V:center}      ' move D2D1_POINT_F to Large (same size)
+        °~StdCall(pfnD2D1MakeRotateMatrix)( Sgl:p0!, Large:tmp, V:matrix)
+        D2D1MakeRotateMatrix( p0!, p1!, p2!, matrix)
+      Case 2  ' Set Skewing
+        °Static Long pfnD2D1MakeSkewMatrix = GetProcAddress(GetModuleHandle("d2d1.dll"), "D2D1MakeSkewMatrix")
+        °
+        ' p0 = angleX, p1 = angleY, p2 = x-coord, p3 = y-coord
+        °center.x = p2!, center.y = p3!      ' center of rotation
+        °Large{V:tmp} = Large{V:center}      ' move D2D1_POINT_F to Large (same size)
+        °~StdCall(pfnD2D1MakeSkewMatrix)( Sgl:p0!, Sgl:p1!, Large:tmp, V:matrix)
+        D2D1MakeSkewMatrix(p0!, p1!, p2!, p3!, matrix)
+      Case 3  ' Set Scaling
+        ' p0 = scalex, p1 = scaley, p2 = centerx, p3 = centery
+        matrix.f11 = p0!
+        matrix.f12 = 0.0
+        matrix.f21 = 0.0
+        matrix.f22 = p1!
+        matrix.f31 = p2! - p0! * p2!
+        matrix.f32 = p3! - p1! * p3!
+
+      Case 4  ' Set Translation
+        matrix.f11 = 1.0
+        matrix.f22 = 1.0
+        matrix.f31 = p0!
+        matrix.f32 = p1!
+
+      Case 5  ' Invert current matrix
+        ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetTransform)})(pD2CurRT, V:matrix)
+
+        °Static Long pfnD2D1IsMatrixInvertible = GetProcAddress(GetModuleHandle("d2d1.dll"), "D2D1IsMatrixInvertible")
+        °Static Long pfnD2D1InvertMatrix = GetProcAddress(GetModuleHandle("d2d1.dll"), "D2D1InvertMatrix")
+        °
+        °If StdCall(pfnD2D1IsMatrixInvertible)(V:matrix) _
+          ~StdCall(pfnD2D1InvertMatrix)(V:matrix)
+
+        If D2D1IsMatrixInvertible(matrix) Then D2D1InvertMatrix(matrix)
+      EndSwitch
+
+      If mode% %& 8     ' add/multiply to current transform
+        ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetTransform)})(pD2CurRT, V:a)
+        b = matrix                     ' copy to b
+        // SetProduct: matrix = a * b
+        matrix.f11 = (a.f11 * b.f11) + (a.f12 * b.f21)
+        matrix.f12 = (a.f11 * b.f12) + (a.f12 * b.f22)
+        matrix.f21 = (a.f21 * b.f11) + (a.f22 * b.f21)
+        matrix.f22 = (a.f21 * b.f12) + (a.f22 * b.f22)
+        matrix.f31 = (a.f31 * b.f11) + (a.f32 * b.f21) + b.f31
+        matrix.f32 = (a.f31 * b.f12) + (a.f32 * b.f22) + b.f32
+      EndIf
+    EndIf
+
+    ''' D2RT_SetTransform(D2CurRT, matrix)
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.SetTransform)})(pD2CurRT, V:matrix)
+  EndIf
+
+EndProc
+
+>Proc D2TransformSave() Naked
+  $Export Proc D2TransformSave "Saves the current state of the transformation."
+  If pD2CurRT
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetTransform)})(pD2CurRT, V:D2SaveMatrix)
+  EndIf
+EndProc
+
+>Proc D2TransformRestore() Naked
+  $Export Proc D2TransformRestore "Restores the previously saved state of the transformation."
+  If pD2CurRT
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.SetTransform)})(pD2CurRT, V:D2SaveMatrix)
+  EndIf
+EndProc
+
+' TransformStack allows us to save and restore transformations on a stack.
+' Although a nice algorithm, it comes with a performance penalty. So, stick to
+' saving only one transformation setting.
+
+°Proc TransformStack(cmd As Int, ID As Int, ByRef t As D2D1_MATRIX_3X2_F)
+°Local i As Int, Cnt As Int, iData As Int, fFound As Bool
+°Static stk As String
+°Global Enum TfStackPush, TfStackPop, TfStackRemove
+°' Find ID location in string
+°i = 1       ' start at position 1
+°While i < Len(stk) && !fFound
+°If Cv4(stk, i) == ID
+°fFound = True
+°Cnt = Cv1(stk, i + 4)
+°Else
+°i += 5 + Cv1(stk, i + 4) * SizeOf(t)
+°EndIf
+°Wend
+°
+°If cmd == TfStackPush           ' push data
+°If fFound
+°iData = i + 5 + Cnt * SizeOf(t)       ' end of stk for ID
+°stk = Left(stk, iData - 1) + StrPeek(V:t, Len(t)) + Mid(stk, iData) ' insert data
+°Mid(stk, i + 4, 1) = Mk1(Cnt + 1)         ' update Cnt field
+°Else                                        ' append new to end of string
+°stk += Mk4(ID) + Mk1(1) + StrPeek(V:t, Len(t))  ' ID + Cnt (1) + data
+°EndIf
+°
+°ElseIf cmd == TfStackPop       ' pop data
+°MemZero V:t, SizeOf(t)
+°If !D2DebugOff
+°Assert fFound ' Stack data not available
+°EndIf
+°If fFound                                           ' ID must be present
+°iData = i + 5 + (Cnt - 1) * SizeOf(t)         ' idx before last data-entry
+°StrPoke V:t, Mid(stk, iData, SizeOf(t))           ' copy data to retval
+°stk = Left(stk, iData - 1) + Mid(stk, iData + SizeOf(t))    ' remove data
+°Cnt--
+°If Cnt == 0                                       ' no more data
+°stk = Left(stk, i - 1) + Mid(stk, i + 5)        ' remove ID + Cnt fields
+°Else
+°Mid(stk, i + 4, 1) = Mk1(Cnt)                   ' update Cnt field
+°EndIf
+°EndIf
+°
+°ElseIf cmd == TfStackRemove       ' remove data
+°If fFound
+°iData = i + 5 + Cnt * SizeOf(t)       ' idx after last data-entry
+°stk = Left(stk, i - 1) + Mid(stk, iData)  ' remove entire ID + Cnt + data
+°EndIf
+°
+°EndIf
+°
+°EndProc
+'
+$Group "Drawing & Shapes"
+>Proc D2BeginDraw(RT As Object, Optional argbClear As Variant) Naked
+  $Export Proc D2BeginDraw "RT [, argbCol]"#10 _
+    "Initiates drawing on the specified render target, " _
+    "optionally clearing target with specified argbCol."
+
+  ' If !IsNothing(RT)    ' RT might be nothing if WM_PAINT is xq-ed before a call to D2GetRT
+  pD2CurRT = {V:RT}
+  '  Set D2CurRT = RT
+  'EndIf
+
+  If pD2CurRT    ' Render target is not set
+    ' Set default ARGB colors
+    D2BackColor = D2C_White     ' window background color, used as the default for D2Clear
+    D2ForeColor = D2C_Black     ' default drawing color
+    D2BkColor   = D2C_White     ' background color drawing, only D2Preset
+
+    ' Set default stroke width otherwise shapes aren't drawn without prior use of D2DefLine.
+    D2D1StrokeWidth! = 1.0
+
+    ' Initialize the transform-save variable with identity matrix, so a D2TransformRestore
+    ' without a D2TransformSave will simply reset the transformation.
+    MemZero V:D2SaveMatrix, SizeOf(D2D1_MATRIX_3X2_F)
+    D2SaveMatrix.f11 = 1.0     ' create Identity matrix
+    D2SaveMatrix.f22 = 1.0
+
+    °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.BeginDraw)})(pD2CurRT)
+    . mov eax, pD2CurRT       ; get  object's addr
+    . push eax                ; push  object's addr
+    . mov eax, dpt [ eax]     ; get vtable addr
+    . mov eax, dpt[ eax + OffsetOf(ID2D1RenderTargetVtbl.BeginDraw)]
+    . call eax                ; call
+
+    If !IsMissing(argbClear) Then D2Clear argbClear
+
+  EndIf
+EndProc
+
+>Procedure D2EndDraw() Naked
+  $Export Proc D2EndDraw "Ends drawing operations on the render target." _
+    "Inspect D2EndDrawError for any rendering error."
+
+  If pD2CurRT                ' Render target is not set
+
+    D2Clip                              ' Off, before calling EndDraw!
+
+    D2EndDrawError = StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.EndDraw)})(pD2CurRT, 0, 0)
+
+    D2Transform                         ' set to Identity transform
+
+    ' Reset all global objects used while drawing to current rendertarget
+    ' Do not release oIDWriteTextFormat (font) because it is not
+    ' part of the RenderTarget. (Although it is released after each new D2SetFont command.)
+
+    Set D2DefFillBrush   = Nothing      ' release current brush D2DefFill
+    Set D2StrokeStyle    = Nothing      ' release D2DefLine's stroke object (penstyle)
+    Set D2LineColorBrush = Nothing      ' release colored line-brush used to draw lines
+    pD2DefFillBrushRTOwner = 0          ' RT and brush no longer attached
+
+    'Set D2CurRT = Nothing               ' variable no longer indicates a current RT
+    pD2CurRT = 0
+  EndIf
+
+EndProc
+
+>Proc D2Flush() Naked
+  $Export Proc D2Flush "Executes all pending drawing commands."
+  Local Large tag1, tag2
+  ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.Flush)})(pD2CurRT, V:tag1, V:tag2)
+EndProc
+
+>Proc D2Clear(Optional argbColor As Variant) Naked
+  $Export Proc D2Clear "[argbColor]" #10 _
+    "Clears the drawing area with the specified argbColor or otherwise D2BackColor background color (default white)."
+
+  Dim cc As D2D1_COLOR_F
+  If pD2CurRT
+    If !IsMissing(argbColor)
+      If !D2DebugOff
+        Assert VarType(argbColor) == basInt ' Argument must be ARGB (Long)
+      EndIf
+      cc = D2D1ColorF(argbColor)
+    Else                 ' no argument
+      cc = D2D1ColorF(D2BackColor)
+    EndIf
+    '''  D2RT_Clear(D2CurRT, cc)
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.Clear)})(pD2CurRT, V:cc)
+  EndIf
+
+EndProc
+
+>Proc D2Color(Optional argbFore As Variant, Optional argbBack As Variant) Naked
+  $Export Proc D2Color "[argbFore][, argbBkColor]" #10 _
+    "Sets the fore- and background drawing colors from an ARGB color value."
+
+  ' Syntax: D2Color [argbFore][, argbBack]
+  If !IsMissing(argbFore) ' 1st param specified?
+    If !D2DebugOff
+      Assert VarType(argbFore) == basInt ' Color value
+    EndIf
+    D2ForeColor = argbFore
+  EndIf
+  If !IsMissing(argbBack)
+    If !D2DebugOff
+      Assert VarType(argbBack) == basInt ' Color value
+    EndIf
+    D2BkColor = argbBack
+  EndIf
+EndProc
+
+>Proc D2RGBColor(Optional rgbFore As Variant, Optional rgbBack As Variant) Naked
+  $Export Proc D2RGBColor "[rgbForeColor][, rgbBkColor]" #10 _
+    "Sets the fore- and background drawing colors from a RGB value."
+
+  Dim rgbcol As Long
+  If !IsMissing(rgbFore) ' 1st param specified?
+    If !D2DebugOff
+      Assert VarType(rgbFore) == basInt ' Color value
+    EndIf
+    ' Convert to ARGB
+    rgbcol = rgbFore
+    D2ForeColor = ARGB(0, GetByte3(rgbcol), GetByte2(rgbcol), GetByte1(rgbcol))
+  EndIf
+  If !IsMissing(rgbBack)
+    If !D2DebugOff
+      Assert VarType(rgbBack) == basInt ' Color value
+    EndIf
+    rgbcol = rgbBack
+    D2BkColor = ARGB(0, GetByte3(rgbcol), GetByte2(rgbcol), GetByte1(rgbcol))
+  EndIf
+EndProc
+
+>Proc D2Clip(Optional x0!, Optional y0!, Optional x1!, Optional y1!) Naked
+  $Export Proc D2Clip "[x0!, y0!, x1!, y1!]" #10 _
+    "Clips subsequent drawings to the clipping rectangle using RT's antialias setting or " _
+    "disables clipping when used without arguments."
+
+  Static Bool fD2ClipOn
+
+  Dim rcf As D2D1_RECT_F, AntiAliasMode%
+  If pD2CurRT
+
+    If fD2ClipOn         ' if clip is set, pop it
+      °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.PopAxisAlignedClip)})(pD2CurRT)
+      . mov eax, pD2CurRT       ; get  object's addr
+      . push eax                ; push  object's addr
+      . mov eax, dpt [ eax]     ; get vtable addr
+      . mov eax, dpt[ eax + OffsetOf(ID2D1RenderTargetVtbl.PopAxisAlignedClip)]
+      . call eax                ; call
+
+      fD2ClipOn = False  ' no clip has been set yet
+    EndIf
+
+    If !(x1! == 0 || y1! == 0)
+      rcf.left = x0!
+      rcf.top = y0!
+      rcf.right = x1!
+      rcf.bottom = y1!
+
+      °AntiAliasMode% = StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.GetAntialiasMode)})(pD2CurRT)
+      . mov eax, pD2CurRT       ; get  object's addr
+      . push eax                ; push  object's addr
+      . mov eax, dpt [ eax]     ; get vtable addr
+      . mov eax, dpt[ eax + OffsetOf(ID2D1RenderTargetVtbl.GetAntialiasMode)]
+      . call eax                ; call
+      °~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.PushAxisAlignedClip)})(pD2CurRT, _
+        V:rcf, AntiAliasMode%)
+      . push eax                ; antialiasmode
+      . lea eax, rcf
+      . push eax
+      . mov eax, pD2CurRT       ; get  object's addr
+      . push eax                ; push  object's addr
+      . mov eax, dpt [ eax]     ; get vtable addr
+      . mov eax, dpt[ eax + OffsetOf(ID2D1RenderTargetVtbl.PushAxisAlignedClip)]
+      . call eax                ; call
+
+      fD2ClipOn = True
+
+    EndIf
+  EndIf
+EndProc
+
+Proc D2DefLine(Optional param As Variant, Optional thickness! = 1, Optional dashOffset!, Optional miterLimit! = 10 )
+  $Export Proc D2DefLine "[style% | D2Stroke] [, thickness!] [,dashOffset!] [,miterLimit!]" #10 _
+    "Sets the appearance of the line for drawing commands. See Help for detailed information."
+
+  If !IsNothing(oD2D1Factory) ' Drect2D not initialized (use D2GetRT)
+
+    ' Defines line characteristics for use with D2* drawing operations.
+    ' Sets globals D2StrokeStyle object & D2D1StrokeWidth!.
+
+    Dim strokeStyleProperties As D2D1_STROKE_STYLE_PROPERTIES
+    If !IsMissing(param)             ' Set or create a Stroke style object
+      If IsObject(param)             ' param is an Object?
+        If !D2DebugOff
+          Assert IsTypeOfObject(param, IID_ID2D1StrokeStyle) ' Object not a D2Stroke
+        EndIf
+        Set D2StrokeStyle = param ' set global stroke object
+
+      ElseIf VarType(param) = basInt ' param is an integer?
+        Local style% = param         ' is style argument
+        If style% %& 256             ' PS_ENDCAP_SQUARE
+          strokeStyleProperties.startCap = D2D1_CAP_STYLE_SQUARE
+          strokeStyleProperties.endCap = D2D1_CAP_STYLE_SQUARE
+          strokeStyleProperties.dashCap = D2D1_CAP_STYLE_SQUARE
+        ElseIf style% %& 512         ' PS_ENDCAP_FLAT
+          strokeStyleProperties.startCap = D2D1_CAP_STYLE_FLAT
+          strokeStyleProperties.endCap = D2D1_CAP_STYLE_FLAT
+          strokeStyleProperties.dashCap = D2D1_CAP_STYLE_FLAT
+        Else                         ' default
+          strokeStyleProperties.startCap = D2D1_CAP_STYLE_ROUND
+          strokeStyleProperties.endCap = D2D1_CAP_STYLE_ROUND
+          strokeStyleProperties.dashCap = D2D1_CAP_STYLE_ROUND
+        EndIf
+        If style% %& 4096
+          strokeStyleProperties.lineJoin = D2D1_LINE_JOIN_BEVEL
+        ElseIf style% %& 8192
+          strokeStyleProperties.lineJoin = D2D1_LINE_JOIN_MITER
+        Else  ' default
+          strokeStyleProperties.lineJoin = D2D1_LINE_JOIN_ROUND
+        EndIf
+
+        strokeStyleProperties.miterLimit = miterLimit!
+        strokeStyleProperties.dashStyle = style% %& %111   ' (0 .. 4)
+        strokeStyleProperties.dashOffset = dashOffset!
+
+        If !IsNothing(D2StrokeStyle) Then Set D2StrokeStyle = Nothing    ' Release current object
+
+        ~StdCall({{{V:oD2D1Factory}} + OffsetOf(ID2D1FactoryVtbl.CreateStrokeStyle)})({V:oD2D1Factory}, _
+          V:strokeStyleProperties, /*V:dashes*/ Null, /*dashesCount*/ 0, V:D2StrokeStyle)
+      EndIf
+    EndIf
+
+    D2D1StrokeWidth! = thickness!  ' if not specified to 1.0 ddp (the D2 default if not specified in a drawing command)
+  EndIf
+
+EndProc
+
+>Function D2Stroke(ByRef strokeStyleProperties As D2D1_STROKE_STYLE_PROPERTIES , _
+  ByRef dashes() As Float, dashesCount As Long) As Object
+
+  $Export Function D2Stroke "(strokeStyleProperties As D2D1_STROKE_STYLE_PROPERTIES, dashes() As Float, dashesCount As Long) as Object" #10 _
+    "Returns a Direct2D stroke object for use with D2DefLine."
+
+  If !IsNothing(oD2D1Factory) ' Drect2D not initialized (use D2GetRT)
+
+    Local pdashes As Long
+    If Dim?(dashes()) > 0 && dashesCount > 0 Then
+      pdashes = ArrayAddr(dashes())
+      strokeStyleProperties.dashStyle = D2D1_DASH_STYLE_CUSTOM
+    Else
+      dashesCount = 0
+    EndIf
+
+    ~StdCall({{{V:oD2D1Factory}} + OffsetOf(ID2D1FactoryVtbl.CreateStrokeStyle)})({V:oD2D1Factory}, _
+      V:strokeStyleProperties, pdashes, dashesCount, V:D2Stroke)
+  EndIf
+
+EndFunc
+
+>Proc D2DefFill(Optional param As Variant)
+  $Export Proc D2DefFill "[argbcolor | D2Brush]" #10 _
+    "Creates and sets a solid color brush or the specified D2Brush for the current RenderTarget."
+
+  ' D2DefFill [argbColor] - Creates a new solid color brush,
+  '   a missing param sets brush to current foreground color.
+  ' D2DefFill D2Brush     - Assigns a D2Brush
+
+  Dim cc As D2D1_COLOR_F, typ As Long
+  If pD2CurRT ' Set current rendertarget first
+
+    If IsObject(param)
+      °Trace D2DefFillBrush
+      °Debug "Set"
+      If !D2DebugOff
+        Assert IsTypeOfObject(param, IID_ID2D1Brush) ' Object not a D2Brush
+      EndIf
+      Set D2DefFillBrush = param
+
+      ' Unfortunately, we cannot prevent assigning a brush from another rendertarget ...
+    Else
+      If IsMissing(param)
+        cc = D2D1ColorF(D2ForeColor)     ' Use current foreground color
+      ElseIf VarType(param) == basInt
+        cc = D2D1ColorF(CLong(param))      ' Use passed ARGB color
+      EndIf
+      Set D2DefFillBrush = Nothing   ' release current brush
+      '''    D2RT_CreateSolidColorBrush( D2CurRT, cc, 0, D2DefFillBrush)  ' relative cheap operation
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateSolidColorBrush)})(pD2CurRT, _
+        V:cc, 0, V:D2DefFillBrush)
+    EndIf
+
+    ' Bind the current global D2DefFillBrush to rendertarget
+    pD2DefFillBrushRTOwner = pD2CurRT
+  EndIf
+
+EndProc
+
+>Function D2Brush(param As Variant, Optional OffX!, Optional OffY!, Optional Opacity! = 1, _
+  Optional fUseDef?) As Object
+
+  $Export Function D2Brush "(argbCol | file$ | D2Bitmap [,OffX!][,OffY!][,Opacity!]) As Object" #10 _
+    "Creates D2Brush object from a color, an image file, or a D2Bitmap for use with drawing commands."
+
+  ' Set Brush = D2Brush(argbcolor)  ' solid color brush
+  ' Set Brush = D2Brush(D2Bitmap)   ' brush from D2Bitmap
+  ' Set Brush = D2Brush(filename)   ' loaded from an imagefile
+
+  Local cc As D2D1_COLOR_F, oD2Bmp As Object, bmpBrushProperties As D2D1_BITMAP_BRUSH_PROPERTIES, _
+    brushProperties As D2D1_BRUSH_PROPERTIES, pbmpBrushProperties As Long
+
+  If pD2CurRT ' Set current rendertarget first
+
+    ' Do not pass Null for brushProperties parameter, setting the OffX and OffY
+    ' seems (sometimes?) necessary to set the brush to the coordinates of the shape.
+
+    brushProperties.opacity = Opacity!          ' Default = 1.0
+    brushProperties.transform.f11 = 1.0
+    brushProperties.transform.f22 = 1.0
+    brushProperties.transform.f31 = OffX!
+    brushProperties.transform.f32 = OffY!
+
+    If VarType(param) == basLong    ' Argument must be ARGB
+      cc = D2D1ColorF(param)
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateSolidColorBrush)})(pD2CurRT, _
+        V:cc, V:brushProperties, V:D2Brush)
+
+    Else
+      If !fUseDef?  ' Do not use Direct2D's default for BitmapBrushProperties?
+        bmpBrushProperties.extendModeX =  D2D1_EXTEND_MODE_WRAP
+        bmpBrushProperties.extendModeY =  D2D1_EXTEND_MODE_WRAP
+        bmpBrushProperties.interpolationMode = D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+        pbmpBrushProperties = V:bmpBrushProperties
+      EndIf
+
+      If VarType(param) == basObject   ' Parameter is Object, must be D2 bitmap object
+        If !D2DebugOff
+          Assert IsTypeOfObject(param, IID_ID2D1Bitmap) ' param is not a D2Bitmap
+        EndIf
+        Set oD2Bmp = param
+      ElseIf VarType(param) == basVString
+        Set oD2Bmp = D2Bitmap(param)    ' load image -> D2Bitmap
+      EndIf
+
+      If !IsNothing(oD2Bmp) Then _
+        ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateBitmapBrush)})(pD2CurRT, _
+        {V:oD2Bmp}, pbmpBrushProperties, V:brushProperties, V:D2Brush)
+    EndIf
+  EndIf
+
+EndFunc
+
+>Function D2BrushGradient(type As Long, ByRef aGS() As D2Gradient, nElem%, x0!, y0!, x1!, y1!, _
+  Optional Opacity! = 1, Optional rx!, Optional ry!) As Object
+  $Export Function D2BrushGradient "(type%, GS() As D2Gradient, nElem%, x0!, y0!, x1!, y1! [, Opacity!][, Optional rx!][, Optional ry!]) As Object" #10 _
+    "Returns a linear (type% = 0) or radial gradient (type% = 1) brush object. See Help for more information."
+
+  Type D2Gradient
+    position As Float
+    argbcolor As Long
+  EndType
+
+  Dim linearGradientBrushProperties As D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, _
+    radialGradientBrushProperties As D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, _
+    brushProperties As D2D1_BRUSH_PROPERTIES, transform As D2D1_MATRIX_3X2_F, _
+    i As Long, j As Long, gradientStopCollection As Object
+
+  If pD2CurRT && Dim?(aGS()) > 0 && nElem > 0
+    Dim GrStop(0 .. nElem - 1) As D2D1_GRADIENT_STOP
+
+    ' Convert D2Gradient to D2D1_GRADIENT_STOP
+    j = 0
+    For i = LBound(aGS()) To UBound(aGS())
+      GrStop(j).position = aGS(i).position
+      GrStop(j).color = D2D1ColorF(aGS(i).argbcolor)
+      j++
+    Next
+
+    ' Create an ID2D1GradientStopCollection object
+    '''  D2RT_CreateGradientStopCollection(D2CurRT, ArrayAddr(aGS()), nElem%, D2D1_GAMMA_2_2, _
+      '''  D2D1_EXTEND_MODE_CLAMP, gradientStopCollection)
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateGradientStopCollection)})(pD2CurRT, _
+      ArrayAddr(GrStop()), nElem%, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, V:gradientStopCollection)
+
+    ' Set the brush properties: opacity and identity matrix
+    brushProperties.opacity = Opacity!
+    brushProperties.transform.f11 = 1.0
+    brushProperties.transform.f22 = 1.0
+
+    Switch type
+    Case 0     ' Create an ID2D1LinearGradientBrush
+      linearGradientBrushProperties.startPoint.x = x0!
+      linearGradientBrushProperties.startPoint.y = y0!
+      linearGradientBrushProperties.endPoint.x = x1!
+      linearGradientBrushProperties.endPoint.y = y1!
+      '''    D2RT_CreateLinearGradientBrush(D2CurRT, V:linearGradientBrushProperties, Null, _
+        '''gradientStopCollection, D2BrushGradient)
+
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateLinearGradientBrush)})(pD2CurRT, _
+        V:linearGradientBrushProperties, V:brushProperties, {V:gradientStopCollection}, V:D2BrushGradient)
+
+    Case 1       ' create an ID2D1RadialGradientBrush
+      radialGradientBrushProperties.center.x = x0!
+      radialGradientBrushProperties.center.y = y0!
+      radialGradientBrushProperties.gradientOriginOffset.x = x1!
+      radialGradientBrushProperties.gradientOriginOffset.y = y1!
+      radialGradientBrushProperties.radiusX = rx!
+      radialGradientBrushProperties.radiusY = ry!
+
+      '''    D2RT_CreateRadialGradientBrush(D2CurRT, V:radialGradientBrushProperties, Null, _
+        ''' gradientStopCollection, D2BrushGradient)
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateRadialGradientBrush)})(pD2CurRT, _
+        V:radialGradientBrushProperties, V:brushProperties, {V:gradientStopCollection}, V:D2BrushGradient)
+
+    EndSwitch
+  EndIf
+
+EndFunc
+
+>Proc D2Preset(x!, y!, Optional argbcol As Variant) Naked
+  $Export Proc D2Preset "x!, y! [argbColor]" #10 _
+    "Sets a graphic point at x, y in the current D2BkColor or optional argbcol color."
+  If IsMissing(argbcol)
+    D2PSet(x!, y!, IsMissing(argbcol) ? D2BkColor : CLong(argbcol))
+    °Else
+    °D2PSet(x!, y!, argbcol)
+  EndIf
+
+EndProc
+
+>Proc D2PSet(x!, y!, Optional argcol As Variant) Naked
+  $Export Proc D2PSet "x!, y!, [,argcolor]" #10 _
+    "Plots a square dot using argcol or the foreground color " _
+    "(differs from D2Plot which plots a rounded dot)."
+
+  Dim pBrPenCol As Long, colorf As D2D1_COLOR_F, usecol As Long
+
+  ' Save Pset's current color and brush to prevent the creation
+  ' of a color brush each time Pset is called.
+  Static CurForeCol As Long, BrForeCol As Object
+  If pD2CurRT
+    If !IsMissing(argcol) && VarType(argcol) == basInt   ' use passed color
+      usecol = argcol
+      If CurForeCol != usecol || IsNothing(BrForeCol)    ' need a new brush?
+        colorf = D2D1ColorF(usecol)
+        CurForeCol = usecol                              ' save current color used for brush
+        If !IsNothing(BrForeCol) Then Set BrForeCol = Nothing
+        ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateSolidColorBrush)})(pD2CurRT, _
+          V:colorf, 0, V:BrForeCol)
+      EndIf
+      pBrPenCol = {V:BrForeCol}
+    Else
+      D2SetLineColBrush         ' use D2LineColorBrus
+      pBrPenCol = {V:D2LineColorBrush}
+    EndIf
+
+    Local Float x2, y2
+    x2 = x + 1
+    y2 = y + 1
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawLine)})(pD2CurRT, _
+      Sgl:x, Sgl:y, Sgl:x2, Sgl:y2,  pBrPenCol, Sgl:1, 0)
+  EndIf
+
+EndProc
+
+>Proc D2Plot(x!, y!, Optional D2Brush As Object)
+  $Export Proc D2Plot "x!, y! [,D2BrushPen]" #10 _
+    "Plots a rounded dot using D2BrushPen or the current foreground color (differs from D2PSet which plots a square dot)."
+
+  Dim pBrPenCol As Long
+
+  Static Stroke As Object
+
+  If pD2CurRT
+    If IsNothing(Stroke)      ' Need a rounded style stroke (Static)
+      Dim strokeStyleProp As D2D1_STROKE_STYLE_PROPERTIES, dashes() As Float
+      strokeStyleProp.startCap = D2D1_CAP_STYLE_ROUND
+      strokeStyleProp.endCap = D2D1_CAP_STYLE_ROUND
+      strokeStyleProp.dashCap = D2D1_CAP_STYLE_ROUND
+      Set Stroke = D2Stroke(strokeStyleProp, dashes(), 0)
+    EndIf
+
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pBrPenCol = {V:D2Brush}
+    Else
+      D2SetLineColBrush
+      pBrPenCol = {V:D2LineColorBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawLine)})(pD2CurRT, _
+      Sgl:x, Sgl:y, Sgl:x, Sgl:y,  pBrPenCol, Sgl:1, {V:Stroke})
+  EndIf
+EndProc
+
+>Proc D2SetLineColBrush() Naked ' Change color brush for line and text commands if forecolor changed
+  Static Long D2LineColorSave, pRTSave
+
+  Dim colorf As D2D1_COLOR_F
+  If pD2CurRT
+    If D2LineColorSave != D2ForeColor || IsNothing(D2LineColorBrush)
+      colorf = D2D1ColorF(D2ForeColor)
+      If !IsNothing(D2LineColorBrush) Then Set D2LineColorBrush = Nothing
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateSolidColorBrush)})(pD2CurRT, _
+        V:colorf, 0, V:D2LineColorBrush)
+      D2LineColorSave = D2ForeColor         ' remember color used for D2LineColorBrush
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2Line(x1!, y1!, x2!, y2!, Optional D2Brush As Object)
+  $Export Proc D2Line "x1!, y1!, x2!, y2! [,D2BrushPen]" #10 _
+    "Draws a line on the current render target using " _
+    "D2DefLine setting and the current color or the specified pen brush."
+
+  Dim pbrPenCol As Long
+
+  If pD2CurRT
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pbrPenCol = {V:D2Brush} ' use it
+    Else                      ' create brush from forecolor
+      D2SetLineColBrush
+      pbrPenCol = {V:D2LineColorBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawLine)})(pD2CurRT, _
+      Sgl:x1, Sgl:y1, Sgl:x2, Sgl:y2, pbrPenCol, Sgl:D2D1StrokeWidth!, {V:D2StrokeStyle})
+  EndIf
+
+EndProc
+
+>Proc D2Box(x1!, y1!, x2!, y2!, Optional D2Brush As Object)
+  $Export Proc D2Box "x1!, y1!, x2!, y2! [,D2BrushPen]" #10 _
+    "Draws the outline of a rectangle using " _
+    "D2DefLine setting and the current color or the specified pen brush."
+
+  Dim rcf As D2D1_RECT_F, pbrPenCol As Long
+
+  If pD2CurRT ' Not a current render target, use D2SetRT
+    rcf.left = x1! : rcf.top = y1!
+    rcf.right = x2! : rcf.bottom = y2!
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pbrPenCol = {V:D2Brush}     ' use it
+    Else                      ' create brush from forecolor
+      D2SetLineColBrush
+      pbrPenCol = {V:D2LineColorBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawRectangle)})(pD2CurRT, _
+      V:rcf, pbrPenCol, Sgl:D2D1StrokeWidth! , {V:D2StrokeStyle})
+  EndIf
+
+EndProc
+
+>Proc D2PBox(x1!, y1!, x2!, y2!, Optional D2Brush As Object)
+  $Export Proc D2PBox "x1!, y1!, x2!, y2! [, D2BrushFill]" #10 _
+    "Draws a filled rectangle using the specified D2Brush or the current brush set with D2DefFill."
+
+  Dim rcf As D2D1_RECT_F, pBrush As Long
+  If pD2CurRT
+
+    rcf.left = x1! : rcf.top = y1!
+    rcf.right = x2! : rcf.bottom = y2!
+
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pBrush = {V:D2Brush}
+    Else
+      If IsNothing(D2DefFillBrush) Then D2DefFill D2ForeColor    ' brush from current color
+      If !D2DebugOff
+        Assert pD2DefFillBrushRTOwner == pD2CurRT ' Current brush not owned by rendertarget, use D2DefFill first
+      EndIf
+      pBrush = {V:D2DefFillBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.FillRectangle)})(pD2CurRT, _
+      V:rcf, pBrush)
+
+    ' If penwidth is not 0 (D2DefLine , 0), draw outline using foreground color.
+    If D2D1StrokeWidth! != 0.0! Then D2Box(x1!, y1!, x2!, y2!)
+  EndIf
+
+EndProc
+
+>Proc D2RBox(x1!, y1!, x2!, y2!, Optional rx! = 10, Optional ry! =10, Optional D2Brush As Object)
+  $Export Proc D2RBox "x1!, y1!, x2!, y2! [,rx! = 10][,ry! = 10][,D2BrushPen]" #10 _
+    "Draws the outline of rounded rectangle using current D2DefLine and the current color, or the specified pen brush."
+
+  Dim r As D2D1_ROUNDED_RECT, pbrPenCol As Long
+  If pD2CurRT
+
+    r.rect.left = x1!, r.rect.top = y1!
+    r.rect.right = x2!, r.rect.bottom = y2!
+    r.radiusX = rx!, r.radiusY = ry!
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pbrPenCol = {V:D2Brush} ' use it
+    Else                      ' create brush from forecolor
+      D2SetLineColBrush
+      pbrPenCol = {V:D2LineColorBrush}
+    EndIf
+    ''' D2RT_DrawRoundedRectangle(D2CurRT, r, brPenCol, D2D1StrokeWidth!, D2StrokeStyle)
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawRoundedRectangle)})(pD2CurRT, _
+      V:r, pbrPenCol, Sgl:D2D1StrokeWidth! , {V:D2StrokeStyle})
+  EndIf
+
+EndProc
+
+>Proc D2PRBox(x1!, y1!, x2!, y2!, Optional rx! = 10, Optional ry! =10, Optional D2Brush As Object)
+  $Export Proc D2PRBox "x1!, y1!, x2!, y2! [,rx! = 10][,ry! = 10][,D2BrushFill]" #10 _
+    "Draws a filled rounded rectangle using D2BrushFill or current brush set with D2DefFill."
+
+  ' Syntax: D2PRBox x1, y1, x2, y2 [,rx] [,ry] [, brushFill]
+  Dim r As D2D1_ROUNDED_RECT, pBrush As Long
+  If pD2CurRT
+
+    r.rect.left = x1!, r.rect.top = y1!
+    r.rect.right = x2!, r.rect.bottom = y2!
+    r.radiusX = rx!, r.radiusY = ry!
+
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pBrush = {V:D2Brush}
+    Else
+      If IsNothing(D2DefFillBrush) Then D2DefFill D2ForeColor   ' brush from current color
+      If !D2DebugOff
+        Assert pD2DefFillBrushRTOwner == pD2CurRT ' Current brush not owned by rendertarget, use D2DefFill first
+      EndIf
+      pBrush = {V:D2DefFillBrush}
+    EndIf
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.FillRoundedRectangle)})(pD2CurRT, _
+      V:r, pBrush)
+
+    ' If penwidth is not 0 (D2DefLine , 0), draw outline using foreground color.
+    If D2D1StrokeWidth! != 0.0! Then D2RBox(x1!, y1!, x2!, y2!, rx!, ry!)
+
+  EndIf
+
+EndProc
+
+>Function DefArcPieGeo(x!, y!, rx!, ry!, w1%, w2%, fPie?, fCloseFigure?) As Object
+  Local geo As Object, geoSink As Object
+  Local arcSeg As D2D1_ARC_SEGMENT
+  Local Float xs, ys, xe, ye
+  Local pts(1) As D2D1_POINT_2F
+
+  xs = x + (CosQ(w1) * rx), ys = y - (SinQ(w1) * ry)  ' start coordinates
+  xe = x + (CosQ(w2) * rx), ye = y - (SinQ(w2) * ry)  ' end coordinates
+  arcSeg.point.x = xe
+  arcSeg.point.y = ye
+  arcSeg.size.width = rx
+  arcSeg.size.height = ry
+  arcSeg.sweepDirection = 0         ' always counter clockwise, draw from w1 to w2
+  If w1 > w2 Then w2 = w2 + 360
+  If w2 - w1 > 180 Then arcSeg.arcSize = 1
+
+  Set geo = D2PathGeometry()
+  Set geoSink = D2GeometrySink(geo)
+  If fPie?
+    D2Sink_BeginFigure geoSink, xe, ye
+    pts(0).x = x, pts(0).y = y
+    pts(1).x = xs, pts(1).y = ys
+    D2Sink_AddLines geoSink, pts(), 2
+  Else
+    D2Sink_BeginFigure geoSink, xs, ys
+  EndIf
+  D2Sink_AddArc geoSink, arcSeg             ' draw arc-segment
+  D2Sink_EndFigure geoSink, Iif(fCloseFigure? == True && fPie? == False, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN)
+  D2Sink_Close geoSink
+
+  Set DefArcPieGeo = geo
+EndFunc
+
+>Proc D2Circle(x!, y!, r!, Optional w1%, Optional w2%, Optional Figure%, Optional D2Brush As Object)
+  $Export Proc D2Circle "x!, y!, r! [,w1%][,w2%][,Figure%][, D2BrushPen]" #10 _
+    "Draws a circle or optionally an (closed) arc or pie between w1 and w2 (in degrees). Circle uses style and width set with D2DefLine, " _
+    "arc is a solid line using a solid color brush or the optional D2BrushPen. " _
+    "Optional Figure% determines the shape, 0 (default) is arc, 1 draws a closed arc, 2 draws a pie."
+
+  Dim e As D2D1_ELLIPSE, pbrPenCol As Long, geoArc As Object
+  If pD2CurRT ' Not a current render target, use D2SetRT
+
+    If w1 == 0 && w2 == 0     ' entire circle
+      e.point.x = x!, e.point.y = y!
+      e.radiusX = r!, e.radiusY = r!
+
+      If !IsNothing(D2Brush)
+        If !D2DebugOff
+          Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+        EndIf
+        pbrPenCol = {V:D2Brush}
+      Else                      ' create penbrush from forecolor
+        D2SetLineColBrush
+        pbrPenCol = {V:D2LineColorBrush}
+      EndIf
+
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawEllipse)})(pD2CurRT, _
+        V:e, pbrPenCol, Sgl:D2D1StrokeWidth! , {V:D2StrokeStyle})
+
+    Else                                ' arc only
+      ' If Figure% == 1  fCloseFigure? = True
+      ' ElseIf Figure% == 2  fPie = True
+      Set geoArc = DefArcPieGeo(x!, y!, r!, r!, w1, w2, (Figure == 2), (Figure == 1))
+      D2DrawGeometry geoArc, D2Brush
+
+    EndIf
+  EndIf
+
+EndProc
+
+>Proc D2PCircle(x!, y!, r!,  Optional w1%, Optional w2%, Optional Figure%, Optional D2Brush As Object)
+  $Export Proc D2PCircle "x!, y!, r! [,w1%][,w2%][,Figure%] [, D2BrushFill]" #10 _
+    "Draws the interior of a circle or an outlined and filled pie or arc-segment between w1 and w2 in (degrees). " _
+    "The shape is filled with D2DefFill setting or the specified D2BrushFill. Pie-lines use current foregroundcolor. " _
+    "Optional Figure% determines the shape, 0 (default) draws a pie, 1 draws a closed arc."
+
+
+  Dim e As D2D1_ELLIPSE, pBrush As Long, geoPie As Object
+  If pD2CurRT ' Not a current render target, use D2SetRT
+
+    If w1 == 0 && w2 == 0     ' entire circle
+      e.point.x = x, e.point.y = y!
+      e.radiusX = r!, e.radiusY = r!
+
+      If !IsNothing(D2Brush)
+        If !D2DebugOff
+          Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+        EndIf
+        pBrush = {V:D2Brush}
+      Else                      ' use D2DefFill setting
+        If IsNothing(D2DefFillBrush) Then D2DefFill D2ForeColor  ' brush from current color
+        If !D2DebugOff
+          Assert pD2DefFillBrushRTOwner == pD2CurRT ' Current brush not owned by rendertarget, use D2DefFill first
+        EndIf
+        pBrush = {V:D2DefFillBrush}
+      EndIf
+
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.FillEllipse)})(pD2CurRT, _
+        V:e, pBrush)
+
+      ' If penwidth is not 0 (D2DefLine , 0), draw outline using foreground color.
+      If D2D1StrokeWidth! != 0.0! Then D2Circle(x!, y!, r!)
+
+    Else
+      Set geoPie = DefArcPieGeo(x!, y!, r!, r!, w1, w2, (Figure% == 0), (Figure% == 1))
+      D2FillGeometry geoPie, D2Brush      ' interior of pie
+      D2DrawGeometry geoPie               ' pie lines in foreground color
+
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2Ellipse(x!, y!, rx!, ry!, Optional w1%, Optional w2%, Optional Figure%, Optional D2Brush As Object)
+  $Export Proc D2Ellipse "x!, y!, rx!, ry! [,w1%][,w2%] [,Figure%][, D2BrushPen]" #10 _
+    "Draws an ellipse or optionally an arc between w1 and w2 (in degrees). Ellipse uses style and width set with D2DefLine, " _
+    "arc is a solid line using a solid color brush or the optional D2BrushPen. " _
+    "Optional Figure% determines the shape, 0 (default) is arc, 1 draws a closed arc, 2 draws a pie."
+
+
+  Dim e As D2D1_ELLIPSE, pbrPenCol As Long, geoArc As Object
+
+  If pD2CurRT
+    If w1 == 0 && w2 == 0     ' full ellipse
+
+      e.point.x = x!, e.point.y = y!
+      e.radiusX = rx!, e.radiusY = ry!
+
+      If !IsNothing(D2Brush)
+        If !D2DebugOff
+          Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+        EndIf
+        pbrPenCol = {V:D2Brush}
+      Else                      ' create penbrush from forecolor
+        D2SetLineColBrush
+        pbrPenCol = {V:D2LineColorBrush}
+      EndIf
+
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawEllipse)})(pD2CurRT, _
+        V:e, pbrPenCol, Sgl:D2D1StrokeWidth! , {V:D2StrokeStyle})
+
+    Else        ' arc only
+
+      Set geoArc = DefArcPieGeo(x!, y!, rx!, ry!, w1, w2,  (Figure == 2), (Figure == 1))
+      D2DrawGeometry geoArc, D2Brush
+
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2PEllipse(x!, y!, rx!, ry!,  Optional w1%, Optional w2%, Optional Figure%, Optional D2Brush As Object)
+  $Export Proc D2PEllipse "x!, y!, rx!, ry! [,w1%][,w2%] [,Figure%] [, D2BrushFill]" #10 _
+    "Draws a filled ellipse or a filled pie or filled closed arc-segment between w1 and w2 in (degrees). " _
+    "Shape is filled with D2DefFill setting or the specified D2BrushFill. Pie-lines use current foregroundcolor. " _
+    "Optional Figure% determines the shape, 0 (default) draws a pie, 1 draws a closed arc."
+
+
+  Dim e As D2D1_ELLIPSE, pBrush As Long, geoPie As Object
+  If  pD2CurRT
+    If w1 == 0 && w2 == 0     ' full ellipse
+
+      e.point.x = x!, e.point.y = y!
+      e.radiusX = rx!, e.radiusY = ry!
+      If !IsNothing(D2Brush)
+        If !D2DebugOff
+          Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+        EndIf
+        pBrush = {V:D2Brush}
+
+      Else                      ' use D2DefFill setting
+        If IsNothing(D2DefFillBrush) Then D2DefFill D2ForeColor  ' brush from current color
+        If !D2DebugOff
+          Assert pD2DefFillBrushRTOwner == pD2CurRT ' Current brush not owned by rendertarget, use D2DefFill first
+        EndIf
+        pBrush = {V:D2DefFillBrush}
+      EndIf
+
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.FillEllipse)})(pD2CurRT, _
+        V:e, pBrush)
+
+      ' If penwidth is not 0 (D2DefLine , 0), draw outline using foreground color.
+      If D2D1StrokeWidth! != 0.0! Then D2Ellipse(x!, y!, rx!, ry!)
+
+    Else
+      Set geoPie = DefArcPieGeo(x!, y!, rx!, ry!, w1, w2, (Figure% == 0), (Figure% == 1))
+      D2FillGeometry geoPie               ' interior of pie
+      D2DrawGeometry geoPie               ' pie lines
+
+    EndIf
+  EndIf
+
+EndProc
+
+>Proc D2PolyLine(ByVal n%, ByRef x!(), ByRef y!(), Optional xOff!, Optional yoff!, Optional D2Brush As Object)
+  $Export Proc D2PolyLine "n%, x!(), y!() [, xOff!][, yOff!][,D2BrushPen]" #10 _
+    "Draws a polygon with n corners from coordinates in x() and y(). " _
+    "Uses style and width set with D2DefLine and a solid color brush or the optional D2Brush."
+  Local i%, lb%, j%, pbrPenCol
+  Local x1!, x2!, y1!, y2!
+
+  If  pD2CurRT
+    If n >= 2 && Dim?(x()) >= n && Dim?(y()) >= n
+
+      If !IsNothing(D2Brush)
+        If !D2DebugOff
+          Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+        EndIf
+        pbrPenCol = {V:D2Brush} ' use it
+      Else                      ' create brush from forecolor
+        D2SetLineColBrush
+        pbrPenCol = {V:D2LineColorBrush}
+      EndIf
+
+      lb = LBound(x())
+      For i = 0 To n - 2
+        j = lb + i
+        x1 = x(j) + xOff!
+        y1 = y(j) + yoff!
+        x2 = x(j + 1) + xOff!
+        y2 = y(j + 1) + yoff!
+
+        //    D2Line x(j) + xOff!, y(j) + yoff!, x(j + 1) + xOff!, y(j + 1) + yoff!, D2Brush
+        ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawLine)})(pD2CurRT, _
+          Sgl:x1, Sgl:y1, Sgl:x2, Sgl:y2, pbrPenCol, Sgl:D2D1StrokeWidth!, {V:D2StrokeStyle})
+      Next
+      x1 = x(i) + xOff!
+      y1 = y(i) + yoff!
+      x2 = x(lb) + xOff!
+      y2 = y(lb) + yoff!
+      //D2Line x(i) + xOff!, y(i) + yoff!, x(lb) + xOff!, y(lb) + yoff!, D2Brush
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawLine)})(pD2CurRT, _
+        Sgl:x1, Sgl:y1, Sgl:x2, Sgl:y2, pbrPenCol, Sgl:D2D1StrokeWidth!, {V:D2StrokeStyle})
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2PolyFill(ByVal n%, ByRef x!(), ByRef y!(), Optional xOff!, Optional yOff!, Optional fwinding?, Optional oD2Brush As Object)
+  $Export Proc D2PolyFill "n%, x!(), y!() [, xOff!][, yOff!][,fWinding][,D2BrushFill]" #10 _
+    "Draws a filled polygon with n corners from coordinates in x() and y(). " _
+    "The lines are drawn using the D2ForeColor and D2DefLine settings, the polygon is " _
+    "filled using the D2DefFill setting or the optional D2Brush. Set fWinding to True if polygon is to " _
+    "be filled entirely."
+  Local Object geo
+  If pD2CurRT
+    Set geo = D2DefPoly(n%, x!(), y!(), xOff, yOff, fwinding?)
+    D2FillGeometry geo, oD2Brush
+    D2DrawGeometry geo
+  EndIf
+EndProc
+
+>Function D2DefPoly(ByVal n%, ByRef x!(), ByRef y!(), Optional xOff!, Optional yOff!, Optional fWinding?) As Object
+  $Export Function D2DefPoly "(n%, x!(), y!() [, xOff!][, yOff!][,fWinding?) As Object" #10 _
+    "Returns a polygon geometry object with n corners from coordinates in x() and y()." _
+    "with (optionally) offset xOff, yOff. fWinding determines method of filling (default: alternate). " _
+    "Draw the geometry using D2DrawGeometry and/or D2FillGeometry."
+  Local Object geo, geoSink
+  Local i%, lb%, j%
+  If n >= 2 && Dim?(x()) >= n && Dim?(y()) >= n && LBound(x()) == LBound(y())
+    Local pts(0 .. n - 1) As D2D1_POINT_2F
+    lb = LBound(x())
+    For i = 0 To n - 1
+      j = lb + i : pts(i).x = x(j) + xOff : pts(i).y = y(j) + yOff
+    Next
+
+    Set geo = D2PathGeometry()
+    Set geoSink = D2GeometrySink(geo)
+    D2Sink_FillMode geoSink, fWinding ? D2D1_FILL_MODE_WINDING : D2D1_FILL_MODE_ALTERNATE
+    D2Sink_BeginFigure geoSink, pts(0).x, pts(0).y ' first point, D2FillGeometry will fill
+    D2Sink_AddLines geoSink, pts(), n
+    D2Sink_EndFigure geoSink , D2D1_FIGURE_END_CLOSED
+    D2Sink_Close geoSink
+    Set D2DefPoly = geo
+  EndIf
+EndFunc
+
+>Proc D2Curve(x0!, y0!, x1!, y1!, x2!, y2!, x3!, y3!, Optional D2Brush As Object)
+  $Export Proc D2Curve "x0!, y0!, x1!, y1!, x2!, y2!, x3!, y3! [, Optional D2BrushPen]" #10 _
+    "Creates a cubic Bezier curve between x0,y0 and the specified end point x3,y3, controled by x1,y1 and x2,y2" _
+    "Uses style and width set with D2DefLine and a solid color brush or the optional D2Brush."
+
+  Local geo As Object, geoSink As Object
+  Local b As D2D1_BEZIER_SEGMENT
+  If pD2CurRT
+    b.point1.x = x1!, b.point1.y = y1!
+    b.point2.x = x2!, b.point2.y = y2!
+    b.point3.x = x3!, b.point3.y = y3!
+    Set geo = D2PathGeometry()
+    Set geoSink = D2GeometrySink(geo)
+    D2Sink_BeginFigure geoSink, x0!, y0!, D2D1_FIGURE_BEGIN_HOLLOW
+    D2Sink_AddBezier geoSink, b
+    D2Sink_EndFigure geoSink, D2D1_FIGURE_END_OPEN
+    D2Sink_Close geoSink
+    D2DrawGeometry geo, D2Brush
+  EndIf
+EndProc
+
+'
+$Group "Font & Text"
+>Function D2PointsToDIPs(Points!) As Float Naked
+  $Export Function D2PointsToDips "(Points As Float) As Float" #10 _
+    "Converts a font's pointsize to Dips using: Points*96/72."
+  Return Points! * 96 / 72
+EndFunc
+
+>Function D2DIPsToPoints(Dips!) As Float Naked
+  $Export Function D2DIPsToPoints "(Dips As Float) As Float" #10 _
+    "Converts a D2 font's DIPS to points using: Dips*72/96."
+  Return Dips! * 72 / 96
+EndFunc
+
+>Proc D2SetFont(param As Variant, Optional height!=11, Optional weight% = DWRITE_FONT_WEIGHT_NORMAL, _
+  Optional italic?, Optional stretch% = DWRITE_FONT_STRETCH_NORMAL, Optional LocaleName$ )
+
+  $Export Proc D2SetFont "D2Font | hFont | fname$ [,height!][,weight%][,italic?][,stretch%][,localename$]"#10 _
+    "Sets the current font for D2Text and D2DrawText, " _
+    "the default is a normal font with a height of 11 Dips (9 Points)"
+
+
+  If IsObject(param)           ' a D2Font object?
+    If !IsNothing(param)       ' when xq _Paint without D2GetRT (initialization)
+      If !D2DebugOff
+        Assert IsTypeOfObject(param, IID_IDWriteTextFormat) ' Wrong objecttype
+      EndIf
+      Set oIDWriteTextFormat = param
+    EndIf
+  Else
+    If !IsMissing(LocaleName$)
+      Set oIDWriteTextFormat = D2Font(param, height!, weight%, italic?, stretch%, LocaleName$)
+    Else
+      Set oIDWriteTextFormat = D2Font(param, height!, weight%, italic?, stretch%)
+    EndIf
+    'BUG/TODO Assert on valid oIDWriteTextFormat??
+  EndIf
+
+EndProc
+
+>Function D2Font(param As Variant, Optional height!=11, Optional weight% = DWRITE_FONT_WEIGHT_NORMAL, _
+  Optional italic?, Optional stretch% = DWRITE_FONT_STRETCH_NORMAL, Optional LocaleName$ ) As Object
+
+  $Export Func D2Font "(hFont | fname$ [,height!,weight%,italic?,stretch%,localename$]) As Object"#10 _
+    "Creates a D2Font object for use with D2SetFont, " _
+    "the default is a normal font with a height of 11 Dips (9 Points)"
+
+  ' Sets the current font for text operations.
+  ' Creates an IDWriteTextFormat object that can be used
+  ' to finetune the paragraph settings in D2DrawText.
+  ' Syntax: D2SetFont hFont [,height!]
+  '         D2SetFont fname, [height!, weight%, italic?, stretch%, localename$]
+
+  Dim lf As LOGFONT, fontStyle As Long, fontStretch As Long, fontWeight As Long, _
+    fontHeight As Float
+  Dim vFontFace As Variant, vLocaleName As Variant
+
+  If !IsNothing(oDWriteFactory)      ' Initalization by D2GetRT must be completed
+    If VarType(param) == basLong || VarType(param) == basVString
+      If VarType(param) == basLong
+        Local Long hFont = param
+        ' BUG/TODO What if hFont == 0??
+        If hFont < 32 Then hFont = GetStockObject(hFont)
+        ~apiGetObject(hFont, SizeOf(LOGFONT), lf)
+
+        vFontFace = ZTrim(lf.lfFaceName)  ' facename as Unicode
+
+        ' Note Height in Dips approximates the character cell height of a GDI font.
+        '      So, it is safe to say, fontHeight 'is' character cell height.
+        fontHeight = Abs(lf.lfHeight)     ' Charcell height to Dips
+        fontWeight = lf.lfWeight > 500 ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL
+        If lf.lfItalic Then fontStyle = DWRITE_FONT_STYLE_ITALIC
+        fontStretch = DWRITE_FONT_STRETCH_NORMAL
+        vLocaleName = #0        ' null-byte string Unicode
+
+      ElseIf VarType(param) == basVString
+        vFontFace = param          ' Ansi to Unicode
+        fontHeight = height!       ' Default is 11 Dips
+        fontWeight = weight%
+        If italic? Then fontStyle = DWRITE_FONT_STYLE_ITALIC
+        fontStretch = stretch%
+        vLocaleName = IsMissing(LocaleName$) ? #0 : LocaleName$
+      EndIf
+
+      ' Create the IDWriteTextFormat
+      ~StdCall({{{V:oDWriteFactory}} + OffsetOf(IDWriteFactoryVtbl.CreateTextFormat)})({V:oDWriteFactory}, _
+        {V:vFontFace + 8}, Null, fontWeight, fontStyle, fontStretch, _
+        Sgl:fontHeight, {V:vLocaleName + 8}, V:D2Font)
+    EndIf
+  EndIf
+
+EndFunc
+
+>Function D2RFont(D2FTprop%) As Variant
+  $Export Function D2RFont "(D2FTprop%) As Variant" #10 _
+    "Reads a Font property. Usage: value = D2RFont(D2FT_*)"
+
+  Global Enum D2FT_NAME, D2FT_HEIGHT, D2FT_WEIGHT, D2FT_ITALIC, D2FT_STRETCH, D2FT_LOCALENAME
+
+  Exit Proc If IsNothing(oIDWriteTextFormat)
+
+  Local Length%, sBuf$, Value%
+  Switch D2FTprop
+  Case D2FT_NAME
+    Length% = StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontFamilyNameLength)})({V:oIDWriteTextFormat})
+    sBuf$ = Space((Length% + 1) Mul 2)
+    ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontFamilyName)})({V:oIDWriteTextFormat}, _
+      V:sBuf$, Length% + 1)
+    sBuf$ = Ansi(sBuf$)
+    D2RFont = sBuf$
+  Case D2FT_HEIGHT
+    Local Float size
+    ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontSize)})({V:oIDWriteTextFormat})
+    . fstp dpt [size]
+    D2RFont = size
+  Case D2FT_WEIGHT
+    Value = StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontWeight)})({V:oIDWriteTextFormat})
+    D2RFont = Value
+  Case D2FT_ITALIC
+    Value = StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontStyle)})({V:oIDWriteTextFormat})
+    D2RFont = CBool(Value == DWRITE_FONT_STYLE_ITALIC)
+  Case D2FT_STRETCH
+    Value = StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetFontStretch)})({V:oIDWriteTextFormat})
+    D2RFont = Value
+  Case D2FT_LOCALENAME
+    Length% = StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetLocaleNameLength)})({V:oIDWriteTextFormat})
+    sBuf$ = Space((Length% + 1) Mul 2)
+    ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetLocaleName)})({V:oIDWriteTextFormat}, _
+      V:sBuf$, Length% + 1)
+    sBuf$ = Ansi(sBuf$)
+    D2RFont = sBuf$
+  EndSwitch
+EndFunc
+
+
+>Proc D2TextSize(target As Variant, ByRef width As Float, ByRef height As Float)
+  $Export Proc D2TextSize "Txt | D2TextLayout, width!, height!" #10 _
+    "Returns the size of the specified text string or " _
+    "the size of the specified D2TextLayout object."
+
+  Dim stringLength As Long, pwstr As Long
+  Dim IDWriteTextLayout As Object, hr As Long
+  Dim metrics As DWRITE_TEXT_METRICS
+
+  width = 0, height = 0       ' clear return vars
+
+  If !IsNothing(oDWriteFactory)
+    If IsObject(target)
+      Local pTL As Long = {V:target + 8}       ' address of object from variant
+      Exit Proc If pTL == 0
+      If !D2DebugOff
+        Assert IsTypeOfObject(target, IID_IDWriteTextLayout) ' Not a TextLayout object
+      EndIf
+      ~StdCall({{pTL} + OffsetOf(IDWriteTextLayoutVtbl.GetMetrics)})(pTL, _
+        V:metrics)
+
+      width = metrics.widthIncludingTrailingWhitespace
+      height = metrics.height
+
+    ElseIf VarType(target) == basVString
+      ' Make sure we have a font (a D2WriteTextFormat object)
+      If IsNothing(oIDWriteTextFormat) Then D2SetFont(DEFAULT_GUI_FONT)
+
+      stringLength = {{V:target + 8} - 4} / 2  // Length in chars (2 bytes per char)
+      pwstr = {V:target + 8}                    // addr of BSTR
+
+      ' Call IDWriteFactoryVtbl::CreateTextLayout for an object that
+      ' represents the fully analyzed and formatted result.
+      hr = StdCall({{{V:oDWriteFactory}} + OffsetOf(IDWriteFactoryVtbl.CreateTextLayout)})({V:oDWriteFactory}, _
+        pwstr, stringLength, {V:oIDWriteTextFormat}, Sgl:10000, Sgl:10000, V:IDWriteTextLayout)
+
+      If hr == S_OK
+        ' call IDWriteTextLayout::GetMetrics
+        ~StdCall({{{V:IDWriteTextLayout}} + OffsetOf(IDWriteTextLayoutVtbl.GetMetrics)})({V:IDWriteTextLayout}, _
+          V:metrics)
+        width = metrics.widthIncludingTrailingWhitespace
+        height = metrics.height
+      EndIf
+    EndIf
+  EndIf
+EndProc
+
+>Proc D2Text(x!, y!, sTxt As String, Optional D2Brush As Object, Optional options As Long = D2D1_DRAW_TEXT_OPTIONS_NONE)
+  $Export Proc D2Text "x!, y!, sTxt [,D2Brush][,options%]" #10 _
+    "Draws the specified text at x,y using the foreground color(default) " _
+    "or the specified brush."
+
+  Dim layoutRect As D2D1_RECT_F, pbrCol As Long, stringLength As Long, _
+    w! , h!, cc As D2D1_COLOR_F
+
+  If pD2CurRT ' Not a current render target, use D2SetRT
+
+    ' Set the brush for text coloring
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pbrCol = {V:D2Brush}     ' use it
+    Else                      ' create brush from forecolor
+      D2SetLineColBrush
+      pbrCol = {V:D2LineColorBrush}
+    EndIf
+
+    ' Make sure we have a font (a D2WriteTextFormat object)
+    If IsNothing(oIDWriteTextFormat) Then
+      D2SetFont(DEFAULT_GUI_FONT)
+    EndIf
+
+    ' Set the position and size
+    stringLength = Len(sTxt)
+    Local vTxt As Variant = sTxt   ' to Unicode
+
+    D2TextSize vTxt, w!, h!     ' obtain size of text in DIP
+
+    layoutRect.left = x!
+    layoutRect.top = y!
+    layoutRect.right = x! + w!
+    layoutRect.bottom = y! + h!
+
+    If !IsNothing(oIDWriteTextFormat) _
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawText)})(pD2CurRT, _
+      {V:vTxt + 8}, stringLength, {V:oIDWriteTextFormat}, V:layoutRect, pbrCol, _
+      options, DWRITE_MEASURING_MODE_NATURAL )
+
+  EndIf
+
+EndProc
+
+>Proc D2DrawText(x1!, y1!, x2!, y2!, sTxt As String, ByVal iFormat As Long, _
+  Optional p As Variant, Optional D2Brush As Object, _
+  Optional options As Long)
+
+  $Export Proc D2DrawText "x1, y1, x2, y2, sTxt, format% [,p][,D2Brush][,options%]" #10 _
+    "Draws formatted text sTxt in the rectangle x1,y1,x2,y2 " _
+    "using format% (a combination of D2T_* constants)."
+
+  ' + D2T_TRIM excludes D2T_TABSTOP and D2T_LINESPACING
+  ' + Ignored DT_CALCRECT, DT_EDITCONTROL, DT_EXPANDTABS, DT_INTERNAL,
+  '           DT_MODIFYSTRING, DT_NOFULLWIDTHCHARBREAK,
+  '           DT_HIDEPREFIX, DT_NOPREFIX, DT_PREFIXONLY, DT_WORD_ELLIPSIS
+
+  Dim layoutRect As D2D1_RECT_F, pbrCol As Long, stringLength As Long
+
+  If pD2CurRT
+    ' Make sure we have a font (a IDWriteTextFormat object)
+    If IsNothing(oIDWriteTextFormat) Then D2SetFont(DEFAULT_GUI_FONT)
+
+    ' Set the position and size
+    layoutRect.left = x1!
+    layoutRect.top = y1!
+    layoutRect.right = x2!
+    layoutRect.bottom = y2!
+
+    ' Set the brush for text coloring
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      pbrCol = {V:D2Brush}     ' use it
+    Else                      ' create brush from forecolor
+      D2SetLineColBrush
+      pbrCol = {V:D2LineColorBrush}
+    EndIf
+
+    ' Convert the text to wide and get length
+    stringLength = Len(sTxt)
+    Local vTxt As Variant = sTxt
+
+    ' Apply the iFormat settings to oIDWriteTextFormat
+    ApplyTextFormat(0, oIDWriteTextFormat, iFormat, p)
+
+    If iFormat %& D2T_NOCLIP
+      options &= ~D2D1_DRAW_TEXT_OPTIONS_CLIP     ' remove clipping
+    Else
+      options |= D2D1_DRAW_TEXT_OPTIONS_CLIP      ' add clipping
+    EndIf
+
+    If !IsNothing(oIDWriteTextFormat) _
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawText)})(pD2CurRT, _
+      {V:vTxt + 8}, stringLength, {V:oIDWriteTextFormat}, V:layoutRect, pbrCol, _
+      options, DWRITE_MEASURING_MODE_NATURAL )
+
+    ' Restore oIDWriteTextFormat's previous settings, so the next
+    ' D2DrawText starts with default settings.
+    ApplyTextFormat(-1, oIDWriteTextFormat, 0, 0)
+
+  EndIf
+EndProc
+
+>Proc D2TextLayout(x!, y!, TextLayout As Object, Optional iFormat As Long, Optional p As Variant, _
+  Optional D2Brush As Object, Optional options As Long = D2D1_DRAW_TEXT_OPTIONS_NONE)
+  $Export Proc D2TextLayout "x!, y!, D2Layout [,iFormat][,p][,D2Brush][,options]" #10 _
+    "Draws the D2Layout text object in the current render target."
+
+  Dim brCol As Object
+
+  If pD2CurRT && !IsNothing(TextLayout)
+
+    If !D2DebugOff
+      Assert IsTypeOfObject(TextLayout, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+
+    ' Set the brush for text coloring
+    If !IsNothing(D2Brush)
+      If !D2DebugOff
+        Assert IsTypeOfObject(D2Brush, IID_ID2D1Brush) ' param not a D2Brush
+      EndIf
+      Set brCol = D2Brush     ' use it
+    Else                      ' create brush from forecolor
+      Dim cc As D2D1_COLOR_F = D2D1ColorF(D2ForeColor)
+      ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.CreateSolidColorBrush)})(pD2CurRT, _
+        V:cc, 0, V:brCol)
+    EndIf
+
+
+    ' Apply the iFormat settings to oIDWriteTextLayout(inherited from IDWriteTextFormat)
+    ApplyTextFormat(0, TextLayout, iFormat, p)
+
+    ~StdCall({{pD2CurRT} + OffsetOf(ID2D1RenderTargetVtbl.DrawTextLayout)})(pD2CurRT, _
+      Sgl:x!, Sgl:y!, {V:TextLayout}, {V:brCol}, options )
+
+    ' Do not reset the textformat settings to the TextLayout object as with DrawText.
+
+  EndIf
+
+EndProc
+
+>Function D2Layout(ByRef sTxt As String, ByVal width!, ByVal height!) As Object
+  $Export Function D2Layout "(sTxt$, width!, height!) As Object"#10 _
+    "Creates a D2Layout object (IDWriteTextLayout) for a string with the specified dimension."
+
+  ' Used with D2DefLayout and D2TextLayout.
+
+  Local stringLength As Long, vTxt As Variant
+
+  If !IsNothing(oDWriteFactory)    ' D2 not initialized yet
+    ' Make sure we have IDWriteTextFormat (D2SetFont might be omitted)
+    If IsNothing(oIDWriteTextFormat) _
+      D2SetFont(DEFAULT_GUI_FONT)
+
+    stringLength = Len(sTxt)
+    vTxt = sTxt
+
+    ~StdCall({{{V:oDWriteFactory}} + OffsetOf(IDWriteFactoryVtbl.CreateTextLayout)})({V:oDWriteFactory}, _
+      {V:vTxt + 8}, stringLength, {V:oIDWriteTextFormat}, Sgl:width!, Sgl:height!, V:D2Layout)
+  EndIf
+
+EndFunc
+
+>Proc D2DefLayout(oTL As Object, start%, length%, prop%, vValue As Variant)
+  $Export Proc D2DefLayout "D2Layout, start%, length%, prop%, value" #10 _
+    "Applies a property to a text range of a D2Layout object." #10 _
+    "Usagee: D2DefLayout start, length, prop1, value1" #10 _
+    "To underline char 1 to 4: D2DefLayout 1, 3, D2TL_UNDERLINE, True"
+
+  Global Enum D2TL_FONTNAME, D2TL_WEIGHT, D2TL_STYLE, D2TL_FONTSIZE, D2TL_STRETCH, _
+    D2TL_UNDERLINE,  D2TL_STRIKETHRU, D2TL_LOCALENAME, D2TL_INLINE, D2TL_TYPOGRAPHY, _
+    D2TL_DRAWINGEFFECT, D2TL_MAXWIDTH, D2TL_MAXHEIGHT, D2TL_FONTCOLLECTION, D2TL_MINWIDTH
+
+  ' The IDWriteTextFormat properties cannot be applied to a text range,
+  ' its properties apply to the whole paragraph and must be specified
+  ' with the D2TextLayout command.
+
+  Dim textRange As DWRITE_TEXT_RANGE, i As Long, j As Long, nparam As Long
+
+  Exit Proc If IsNothing(oTL)
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+  EndIf
+
+  textRange.startPosition = start%
+  textRange.length = length%
+
+  'nparam = UBound(p())
+  'Assert nparam >= 1 && Even(nparam + 1) ' # parameters wrong
+
+  'For i = 0 To nparam Step 2
+  'j = i + 1
+  '  Switch CLong(p(i))
+  Switch prop%
+  Case D2TL_FONTNAME
+    Local vFaceName As Variant = vValue ' fontname
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontFamilyName)})({V:oTL}, _
+      {V:vFaceName + 8}, textRange.startPosition, textRange.length)
+
+  Case D2TL_LOCALENAME
+    Local vLocaleName As Variant = vValue ' fontname
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetLocaleName)})({V:oTL}, _
+      {V:vLocaleName + 8}, textRange.startPosition, textRange.length)
+
+  Case D2TL_MAXWIDTH   ' No range, start% and length% are not used
+    If IsNumeric(vValue)
+      Local Width As Float = vValue
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetMaxWidth)})({V:oTL}, _
+        Sgl:Width)
+    EndIf
+
+  Case D2TL_MAXHEIGHT  ' No range, start% and length% are not used
+    If IsNumeric(vValue)
+      Local Height As Float = vValue
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetMaxHeight)})({V:oTL}, _
+        Sgl:Height)
+    EndIf
+
+  Case D2TL_WEIGHT
+    If IsNumeric(vValue)
+      Local Weight As Long = vValue     ' a DWRITE_FONT_WEIGHT constant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontWeight)})({V:oTL}, _
+        Weight, textRange.startPosition, textRange.length)
+    EndIf
+
+  Case D2TL_STYLE
+    If IsNumeric(vValue)
+      Local Style As Long = vValue      ' a DWRITE_FONT_STYLE constant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontStyle)})({V:oTL}, _
+        Style, textRange.startPosition, textRange.length)
+    EndIf
+
+  Case D2TL_STRETCH
+    If IsNumeric(vValue)
+      Local Stretch As Long = vValue    ' a DWRITE_FONT_STRETCH constant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontStretch)})({V:oTL}, _
+        Stretch, textRange.startPosition, textRange.length)
+    EndIf
+
+  Case D2TL_FONTSIZE
+    If IsNumeric(vValue)
+      Local size! = vValue              ' Float, font size in DIP units
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontSize)})({V:oTL}, _
+        Sgl:size!, textRange.startPosition, textRange.length)
+    EndIf
+  Case D2TL_UNDERLINE
+    If IsNumeric(vValue)
+      Local Underline As Long = Abs(CLong((vValue)))  ' Bool, BASIC bool to C bool (long)
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetUnderline)})({V:oTL}, _
+        Underline, textRange.startPosition, textRange.length)
+    EndIf
+  Case D2TL_STRIKETHRU
+    If IsNumeric(vValue)
+      Local Strikethru As Long = Abs(CLong(vValue)) ' Bool, BASIC bool to C bool (long)
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetStrikethrough)})({V:oTL}, _
+        Strikethru, textRange.startPosition, textRange.length)
+    EndIf
+  Case D2TL_DRAWINGEFFECT
+    If IsObject(vValue)
+      Local pDrawEff As Long = {V:vValue + 8}      ' Read pointer from Variant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetDrawingEffect)})({V:oTL}, _
+        pDrawEff, textRange.startPosition, textRange.length)
+    EndIf
+
+  Case D2TL_INLINE
+    If IsObject(vValue)
+      Local pInline As Long = {V:vValue + 8}      ' Read pointer from Variant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetInlineObject)})({V:oTL}, _
+        pInline, textRange.startPosition, textRange.length)
+    EndIf
+  Case D2TL_TYPOGRAPHY
+    If IsObject(vValue)
+      Local ptypo As Long = {V:vValue + 8}      ' Read pointer from Variant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetTypography)})({V:oTL}, _
+        ptypo, textRange.startPosition, textRange.length)
+    EndIf
+  Case D2TL_FONTCOLLECTION
+    If IsObject(vValue)
+      Local pfColl As Long = {V:vValue + 8}      ' Read pointer from Variant
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.SetFontCollection)})({V:oTL}, _
+        pfColl, textRange.startPosition, textRange.length)
+    EndIf
+  EndSwitch
+  'Next i
+EndProc
+
+>Function D2RLayout(oTL As Object, D2TLprop%, Optional curPos%) As Variant
+  $Export Function D2RLayout "(D2Layout, D2TLprop% [,curPos%]) As Variant" #10 _
+    "Reads a D2Layout property."
+
+  Exit Proc If IsNothing(oTL)
+
+  If !D2DebugOff
+    Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+  EndIf
+
+  Local nameLen%, sName$
+  Switch D2TLprop%
+  Case D2TL_FONTNAME
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontFamilyNameLength)})({V:oTL}, _
+      curPos%, *nameLen%, Null)
+    nameLen% ++                    ' room for including #0
+    sName$ = String$(nameLen% * 2, #0)   ' buffer for a wchar string
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontFamilyName)})({V:oTL}, _
+      curPos%, V:sName$, nameLen%, Null  )
+    D2RLayout = Ansi(sName$)
+  Case D2TL_LOCALENAME
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetLocaleNameLength)})({V:oTL}, _
+      curPos%, *nameLen%, Null)
+    nameLen% ++                    ' room for including #0
+    sName$ = String$(nameLen% * 2, #0)   ' buffer for a wchar string
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetLocaleName)})({V:oTL}, _
+      curPos%, V:sName$, nameLen%, Null  )
+    D2RLayout = Ansi(sName$)
+
+  Case D2TL_MAXWIDTH
+    Local Width As Float
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetMaxWidth)})({V:oTL})
+    . fstp dpt [Width]
+    D2RLayout = Width
+
+  Case D2TL_MAXHEIGHT
+    Local Height As Float
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetMaxHeight)})({V:oTL})
+    . fstp dpt [Height]
+    D2RLayout = Height
+
+  Case D2TL_MINWIDTH
+    Local minWidth As Float
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.DetermineMinWidth)})({V:oTL}, V:minWidth)
+    D2RLayout = minWidth
+
+  Case D2TL_WEIGHT
+    Local Weight As Long
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontWeight)})({V:oTL}, _
+      curPos%, *Weight, Null)
+    D2RLayout = Weight
+
+  Case D2TL_STYLE
+    Local Style As Long
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontStyle)})({V:oTL}, _
+      curPos%, *Style, Null)
+    D2RLayout = Style
+
+  Case D2TL_STRETCH
+    Local Stretch As Long
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontStretch)})({V:oTL}, _
+      curPos%, *Stretch, Null)
+    D2RLayout = Stretch
+
+  Case D2TL_FONTSIZE
+    Local Size As Float
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontSize)})({V:oTL}, _
+      curPos%, *Size, Null)
+    D2RLayout = Size
+
+  Case D2TL_UNDERLINE
+    Local Underline As Long
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetUnderline)})({V:oTL}, _
+      curPos%, *Underline, Null)
+    D2RLayout = CBool(Underline)
+
+  Case D2TL_STRIKETHRU
+    Local Strikethru As Long
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetStrikethrough)})({V:oTL}, _
+      curPos%, *Strikethru, Null)
+    D2RLayout = CBool(Strikethru)
+
+
+  Case D2TL_DRAWINGEFFECT
+    Local DrawEff As Object
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetDrawingEffect)})({V:oTL}, _
+      curPos%, V:DrawEff, Null)
+    Set D2RLayout = DrawEff
+
+  Case D2TL_INLINE
+    Local Inline As Object
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetInlineObject)})({V:oTL}, _
+      curPos%, V:Inline, Null)
+    Set D2RLayout = Inline
+
+  Case D2TL_TYPOGRAPHY
+    Local Typo As Object
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetTypography)})({V:oTL}, _
+      curPos%, V:Typo, Null)
+    Set D2RLayout = Typo
+
+  Case D2TL_FONTCOLLECTION
+    Local ftColl As Object
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetFontCollection)})({V:oTL}, _
+      curPos%, V:ftColl, Null)
+    Set D2RLayout = ftColl
+
+  EndSwitch
+EndFunc
+
+>Function D2TL_HitTestPoint(oTL As Object, x!, y!, Optional Inside? = True /*, Optional TrailingHit?*/, _
+  Optional pHitTestMetrics As Long) As Long
+  $Export Function D2TL_HitTestPoint "(D2Layout, x!, y! [,Inside? = True][,pHitTestMetrics%])" #10 _
+    "Returns textposition of character closest at (x,y). " _
+    "Set Iniside to False if (x,y) doesn't need to be in the text string."
+
+  Local hitTestMetrics As DWRITE_HIT_TEST_METRICS
+  Local Long isTrailingHit, isInside
+  D2TL_HitTestPoint = -1
+  If pHitTestMetrics == 0 Then pHitTestMetrics = *hitTestMetrics
+  If !IsNothing(oTL)
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.HitTestPoint)})({V:oTL}, _
+      Sgl: x!, Sgl: y!, *isTrailingHit, *isInside, pHitTestMetrics)
+
+    If !(Inside? && isInside == 0)
+      Local p As Pointer DWRITE_HIT_TEST_METRICS
+      Pointer p = pHitTestMetrics
+      D2TL_HitTestPoint = p.textPosition
+    EndIf
+  EndIf
+
+EndFunc
+
+>Proc D2TL_HitTestTextPos(oTL As Object, textpos%, ByRef pointX!, ByRef pointY!, _
+  ByRef hitTestMetrics As DWRITE_HIT_TEST_METRICS, Optional isTrailingHit?)
+  $Export Proc D2TL_HitTestTextPos "D2Layout, textpos% ,x!, y!, HitTestMetrics [,isTrailingHit?]" #10 _
+    "Returns pixel coordinates in x! and y! for a given textposition in a DWRITE_HIT_TEST_METRICS type."
+
+  pointX! = 0, pointY! = 0
+  If !IsNothing(oTL)
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.HitTestTextPosition)})({V:oTL}, _
+      textpos%, -CInt(isTrailingHit?), *pointX!, *pointY!, *hitTestMetrics)
+  EndIf
+
+EndProc
+
+>Function D2TL_HitTestTextRange(oTL As Object, textPosition%, textLength%, originX!, originY!, _
+  ByRef hitTestMetrics() As DWRITE_HIT_TEST_METRICS) As Long
+
+  $Export Func D2TL_HitTestTextRange "(D2Layout, textpos%, textlength% ,originX!, originY!, hitTestMetrics()) As Long" #10 _
+    "Fills an array of DWRITE_HIT_TEST_METRICS and returns the number of array entries"
+
+  Local Long actualHitTestCount
+
+  If !IsNothing(oTL)
+
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+
+    ' Get the number of entries for the array
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.HitTestTextRange)})({V:oTL}, _
+      textPosition%, textLength%, Sgl:0, Sgl:0, 0, 0, *actualHitTestCount)
+
+    If actualHitTestCount
+      ReDim hitTestMetrics(0 .. actualHitTestCount - 1)
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.HitTestTextRange)})({V:oTL}, _
+        textPosition%, textLength%, Sgl:originX!, Sgl:originY!, ArrayAddr(hitTestMetrics()), _
+        actualHitTestCount, *D2TL_HitTestTextRange )
+    EndIf
+  EndIf
+EndFunc
+
+>Proc D2TL_Metrics(oTL As Object, ByRef metrics As DWRITE_TEXT_METRICS)
+  $Export Proc D2TL_Metrics "D2Layout, metrics" #10 _
+    "Returns the metrics (DWRITE_TEXT_METRICS type) of a D2TextLayout object ."
+
+  If !IsNothing(oTL)
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetMetrics)})({V:oTL}, V:metrics)
+  EndIf
+EndProc
+
+>Function D2TL_LineMetrics(oTL As Object, ByRef metrics() As DWRITE_LINE_METRICS) As Long
+  $Export Func D2TL_LineMetrics "(D2Layout, linemetrics()) As Long" #10 _
+    "Fills an array of DWRITE_LINE_METRICS and returns the number of array elements."
+  Local Long actualLineCount
+  If !IsNothing(oTL)
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+    ' Get the number of lines
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetLineMetrics)})({V:oTL}, _
+      0, 0, *actualLineCount)
+    If actualLineCount
+      ' Re-dimension the array, actualLineCount is always >= 1, otherwise oTL is nothing
+      ReDim metrics(0 .. actualLineCount - 1)
+      ' Obtain the metrics()
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetLineMetrics)})({V:oTL}, _
+        ArrayAddr(metrics()), actualLineCount, *D2TL_LineMetrics)
+    EndIf
+  EndIf
+
+EndFunc
+
+>Function D2TL_ClusterMetrics(oTL As Object, ByRef metrics() As DWRITE_CLUSTER_METRICS) As Long
+  $Export Func D2TL_ClusterMetrics "Cnt = D2TL_ClusterMetrics(D2Layout, clustermetrics())" #10 _
+    "Fills an array of DWRITE_CLUSTER_METRICS and returns the number of array elements."
+  Local Long actualClusterCount
+  If !IsNothing(oTL)
+    If !D2DebugOff
+      Assert IsTypeOfObject(oTL, IID_IDWriteTextLayout) ' Not a D2Layout object
+    EndIf
+    ' Get the number of clusters
+    ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetClusterMetrics)})({V:oTL}, _
+      0, 0, *actualClusterCount)
+    If actualClusterCount
+      ' Re-dimension the array, actualLineCount is always >= 1, otherwise oTL is nothing
+      ReDim metrics(0 .. actualClusterCount - 1)
+      ' Obtain the metrics()
+      ~StdCall({{{V:oTL}} + OffsetOf(IDWriteTextLayoutVtbl.GetClusterMetrics)})({V:oTL}, _
+        ArrayAddr(metrics()), actualClusterCount, *D2TL_ClusterMetrics)
+    EndIf
+  EndIf
+
+EndFunc
+
+>Proc ApplyTextFormat(iMode%, oIDWriteTextFormat As Object, iFormat%, p As Variant)
+  ' Manipulate IDWriteTextFormat.
+  Global Enum D2T_LEFT= DT_LEFT, D2T_CENTER=DT_CENTER, D2T_RIGHT=DT_RIGHT, _
+    D2T_PARCENTER     = DT_VCENTER,   D2T_PARBOTTOM = DT_BOTTOM, _
+    D2T_WORDWRAP      = DT_WORDBREAK, D2T_NOWRAP = DT_SINGLELINE, _
+    D2T_TABSTOP       = DT_TABSTOP,      ' Set hiword of additional parameter _
+    D2T_NOCLIP        = DT_NOCLIP        /*0x100*/, _
+    D2T_PATH_ELLIPSIS = DT_PATH_ELLIPSIS /*0x4000*/, _
+    D2T_END_ELLIPSIS  = DT_END_ELLIPSIS  /*0x8000*/, _
+    D2T_READTOLEFT    = DT_RTLREADING    /*0x20000*/, _
+    D2T_LINESPACING   = $00080000,     ' Set loword of additional parameter _
+    D2T_JUSTIFIED     = $00100000, _
+    /*D2T_CHARWRAP      = $00200000, Windows 8.1 */ _
+    /*D2T_EMERGENCYWRAP = $00400000, Windows 8.1*/ _
+    D2T_READTORIGHT   = $00800000, _
+    D2T_FLOWUP        = $01000000, _
+    D2T_TRIMCHAR      = $02000000,     ' Additional param for TRIM _
+    D2T_TRIMWORD      = $04000000,     ' Set MakeLong(charcode, count) _
+    D2T_FLOWDOWN      = $08000000, _
+    D2T_FLOWTORIGHT   = $10000000, _
+    D2T_FLOWTOLEFT    = $20000000, _
+    D2T_PARTOP        = $40000000
+
+  Local TextAlign%, FlowDir%, WordWrap%, ReadDir%, ParAlign%, TabStop!, _
+    lineSpacingMethod%, lineSpacing!, baseLine!
+  Static Bool fTextAlignChanged, fFlowDirChanged, fWordWrapChanged, fReadDirChanged, _
+    fParAlignChanged, fTrimChanged, fLineSpacingChanged, fTabStopChanged
+
+  If iMode% == 0    ' Apply formatting
+    ' Assume nothing will be changed
+    fTextAlignChanged = False, fFlowDirChanged = False, fWordWrapChanged = False, fReadDirChanged = False, _
+      fParAlignChanged = False, fTrimChanged = False, fLineSpacingChanged = False, fTabStopChanged = False
+
+    ' Set Textalignment
+    If iFormat %& (D2T_LEFT | D2T_CENTER | D2T_JUSTIFIED | D2T_RIGHT)
+      If iFormat %& D2T_CENTER
+        TextAlign% = DWRITE_TEXT_ALIGNMENT_CENTER
+      ElseIf iFormat %& D2T_JUSTIFIED
+        TextAlign% = DWRITE_TEXT_ALIGNMENT_JUSTIFIED
+      ElseIf iFormat %& D2T_RIGHT
+        TextAlign% = DWRITE_TEXT_ALIGNMENT_TRAILING
+      ElseIf iFormat %& D2T_LEFT
+        TextAlign% = DWRITE_TEXT_ALIGNMENT_LEADING
+      EndIf
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetTextAlignment)})({V:oIDWriteTextFormat}, _
+        TextAlign% )
+      fTextAlignChanged = True
+    EndIf
+
+    ' Set FlowDirection, only Left-to-right and vice versa, no to-top and to-bottom
+    If iFormat %& (D2T_FLOWTORIGHT | D2T_FLOWTOLEFT | D2T_FLOWUP | D2T_FLOWDOWN)
+      If iFormat %& D2T_FLOWTORIGHT
+        FlowDir% = DWRITE_FLOW_DIRECTION_LEFT_TO_RIGHT
+      ElseIf iFormat %& D2T_FLOWTOLEFT
+        FlowDir% = DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT
+      ElseIf iFormat %& D2T_FLOWUP
+        FlowDir% = DWRITE_FLOW_DIRECTION_BOTTOM_TO_TOP
+      ElseIf iFormat %& D2T_FLOWDOWN
+        FlowDir% = DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM
+      EndIf
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetFlowDirection)})({V:oIDWriteTextFormat}, _
+        FlowDir% )
+      fFlowDirChanged = True
+    EndIf
+
+    ' Set ReadingDirection
+    If iFormat %& (D2T_READTORIGHT | D2T_READTOLEFT)
+      If iFormat %& D2T_READTORIGHT
+        ReadDir% = DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
+      ElseIf iFormat %& D2T_READTOLEFT
+        ReadDir% = DWRITE_READING_DIRECTION_RIGHT_TO_LEFT
+      EndIf
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetReadingDirection)})({V:oIDWriteTextFormat}, _
+        ReadDir% )
+      fReadDirChanged = True
+    EndIf
+
+    ' Set Paragraph Alignment
+    If iFormat %& (D2T_PARTOP | D2T_PARBOTTOM | D2T_PARCENTER)
+      If iFormat %& D2T_PARBOTTOM
+        ParAlign% = DWRITE_PARAGRAPH_ALIGNMENT_FAR
+      ElseIf iFormat %& D2T_PARCENTER
+        ParAlign% = DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+      ElseIf iFormat %& D2T_PARTOP
+        ParAlign% = DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+      EndIf
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetParagraphAlignment)})({V:oIDWriteTextFormat}, _
+        ParAlign% )
+      fParAlignChanged = True
+    EndIf
+
+    ' Set Trimming, excludes D2T_TABSTOP and D2T_LINESPACING
+    If iFormat %& (D2T_TRIMCHAR | D2T_TRIMWORD | DT_PATH_ELLIPSIS | DT_END_ELLIPSIS)
+      Local trimmingOptions As DWRITE_TRIMMING, IDWriteInlineObject As Object
+      trimmingOptions.granularity = iFormat %& D2T_TRIMCHAR ? DWRITE_TRIMMING_GRANULARITY_CHARACTER : DWRITE_TRIMMING_GRANULARITY_WORD
+      If iFormat %& DT_PATH_ELLIPSIS    ' Might need D2T_NOWRAP
+        trimmingOptions.delimiter = Asc("\")
+        trimmingOptions.delimiterCount = 1
+      ElseIf iFormat %& DT_END_ELLIPSIS ' Might need D2T_NOWRAP
+        trimmingOptions.delimiter = 0
+        trimmingOptions.delimiterCount = 0
+      Else
+        trimmingOptions.delimiter = HiWord(CLong(p))
+        trimmingOptions.delimiterCount = LoWord(CLong(p))
+      EndIf
+
+      ' Create ellipsis as the omission sign.
+      ~StdCall({{{V:oDWriteFactory}} + OffsetOf(IDWriteFactoryVtbl.CreateEllipsisTrimmingSign)})({V:oDWriteFactory}, _
+        {V:oIDWriteTextFormat}, V:IDWriteInlineObject )
+
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetTrimming)})({V:oIDWriteTextFormat}, _
+        V:trimmingOptions, {V:IDWriteInlineObject} )
+      fTrimChanged = True
+    Else
+      ' Set TabStop
+      If iFormat %& D2T_TABSTOP && IsNumeric(p)
+        ' Save current tabstop
+        ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetIncrementalTabStop)})({V:oIDWriteTextFormat} )
+        . fstp dpt [TabStop!]     ' copy return float from ST0 to var
+        Local newTabStop! = HiWord(CLong(p))
+        ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetIncrementalTabStop)})({V:oIDWriteTextFormat}, _
+          {V:newTabStop!} )
+        fTabStopChanged = True
+      EndIf
+
+      ' Set LineSpacing
+      If iFormat %& D2T_LINESPACING && IsNumeric(p)
+        ' Save current linespacing
+        ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.GetLineSpacing)})({V:oIDWriteTextFormat}, _
+          V:lineSpacingMethod%, V:lineSpacing!, V:baseLine! )
+        Local newlinespacing! = LoWord(CLong(p))
+        Local newbasline! = newlinespacing! * 0.8   ' A reasonable ratio to lineSpacing is 80 percent.
+        ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetLineSpacing)})({V:oIDWriteTextFormat}, _
+          DWRITE_LINE_SPACING_METHOD_UNIFORM, {V:newlinespacing!}, {V:newbasline!} )
+        fLineSpacingChanged = True
+      EndIf
+    EndIf
+
+    ' Set WordWrapping (must follow Set Trimmimg)
+    If iFormat %& (D2T_NOWRAP | D2T_WORDWRAP /*| D2T_CHARWRAP | D2T_EMERGENCYWRAP*/)
+      If iFormat %& D2T_NOWRAP
+        WordWrap% = DWRITE_WORD_WRAPPING_NO_WRAP
+      ElseIf iFormat %& D2T_WORDWRAP
+        WordWrap% = DWRITE_WORD_WRAPPING_WRAP
+        °ElseIf iFormat %& D2T_CHARWRAP
+        °WordWrap% = DWRITE_WORD_WRAPPING_CHARACTER
+        °ElseIf iFormat %& D2T_EMERGENCYWRAP
+        °WordWrap% = DWRITE_WORD_WRAPPING_EMERGENCY_BREAK
+      EndIf
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetWordWrapping)})({V:oIDWriteTextFormat}, _
+        WordWrap% )
+      fWordWrapChanged = True
+    EndIf
+
+  Else
+
+    ' Restore to default or previous settings,
+    ' but not after D2TextLayout. The properties that return
+    ' information about the formatted text need these settings.
+    If fLineSpacingChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetLineSpacing)})({V:oIDWriteTextFormat}, lineSpacingMethod%, {V:lineSpacing!}, {V:baseLine!})
+    If fFlowDirChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetFlowDirection)})({V:oIDWriteTextFormat}, 0)
+    If fTextAlignChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetTextAlignment)})({V:oIDWriteTextFormat}, 0)
+    If fReadDirChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetReadingDirection)})({V:oIDWriteTextFormat}, 0)
+    If fParAlignChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetParagraphAlignment)})({V:oIDWriteTextFormat}, 0 )
+    If fWordWrapChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetWordWrapping)})({V:oIDWriteTextFormat}, 0)
+    If fTabStopChanged Then ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetIncrementalTabStop)})({V:oIDWriteTextFormat}, {V:TabStop!} )
+    If fTrimChanged Then
+      trimmingOptions.granularity = DWRITE_TRIMMING_GRANULARITY_NONE
+      trimmingOptions.delimiter = 0
+      trimmingOptions.delimiterCount = 0
+      ~StdCall({{{V:oIDWriteTextFormat}} + OffsetOf(IDWriteTextFormatVtbl.SetTrimming)})({V:oIDWriteTextFormat}, _
+        V:trimmingOptions, 0 )
+    EndIf
+
+  EndIf
+
+
+EndProc
+
+
+
+
+'
+'
+$Group "Helpers (Public)"
+>Function ARGB(alpha|, red|, green|, blue|) As Long Naked
+  $Export Function ARGB "(alpha|, red|, green|, blue|) As Long" #10 _
+    "Returns a long with an ARGB formatted ($AARRGGBB) color value."
+
+  // ARGB = alpha << 24 | red << 16 | green << 8 | blue
+  // Also possible: MakeL4H(alpha|, red|, green|, blue|)
+  . sub eax, eax
+  . mov al, alpha|
+  . shl eax, 8
+  . mov al, red|
+  . shl eax, 8
+  . mov al, green|
+  . shl eax, 8
+  . mov al, blue|
+  . mov ARGB, eax
+EndFunc
+
+>Function D2ColorFtoARGB(red!, green!, blue!, Optional alpha! = 1) As Long Naked
+  $Export Func D2ColorFtoARGB "(red!, green!, blue!, Optional alpha! = 1) As Long" #10 _
+    "Returns an ARGB color value from the amount (0.0 - 1.0) of red!, green!, blue!, and alpha!."
+  Local r|, g|, b|, a|
+  r| = 255.0 * red!
+  g| = 255.0 * green!
+  b| = 255.0 * blue!
+  a| = 255.0 * alpha!
+  . sub eax, eax
+  . mov al, a|
+  . shl eax, 8
+  . mov al, r|
+  . shl eax, 8
+  . mov al, g|
+  . shl eax, 8
+  . mov al, b|
+  . mov D2ColorFtoARGB, eax
+EndFunc
+
+>Function ARGBToRGB(ByVal argbcol As Long) As Long Naked
+  $Export Function ARGBToRGB "(argbcol) As Long" #10 _
+    "Returns a RGB formatted ($00BBGGRR) color value, ignores the aplha channel."
+
+  ' RGB(red, green, blue) ARGB: AARRGGBB
+  ARGBToRGB = RGB(GetByte1(argbcol), GetByte2(argbcol), GetByte3(argbcol))
+EndFunc
+
+'
+$Group "Helpers (Private)"
+>Function D2D1ColorF(ByVal argb As Long) As D2D1_COLOR_F Naked
+  // argb format: 0xaarrggbb
+  Local alpha As Int
+  D2D1ColorF.b = GetByte3(argb) / 255.0
+  D2D1ColorF.g = GetByte2(argb) / 255.0
+  D2D1ColorF.r = GetByte1(argb) / 255.0
+
+  alpha = GetByte0(argb)
+  If alpha == 0
+    D2D1ColorF.a = 1.0
+  Else
+    D2D1ColorF.a = alpha / 255.0
+  EndIf
+EndFunc
+
+>Function IsTypeOfObject(Obj As Object, pIID As Long) As Bool
+  ' Returns False if object is not of specified type or object is nothing.
+  Try
+    ' During testing valid objects - when !IsNothing(obj) - were
+    ' somehow released from memory, especially the brushes. If so
+    ' the next code will fail, so report invalid object.
+    Local pObj% = {V:Obj}   ' get Object's address, call QI
+    If pObj% && StdCall({{pObj%} + 0})(pObj%, pIID, V:pObj) != E_NOINTERFACE
+      ~StdCall({{pObj%} + 8})(pObj%)    'Release (QI increments refcount)
+      IsTypeOfObject = True
+    EndIf
+  Catch
+  EndCatch
+EndFunc
+
+°Function VarToObject(v As Variant) As Object Naked
+°' Use: Set Object = VarToObject(variant)
+°' Makes up for mMissing functionality (Set Object = Variant)
+°If IsObject(v) && {V:v + 8}
+°{V:VarToObject} = {V:v + 8} ' move pointer into variable
+°' Now two variables are pointing to the same object, but
+°' reference count was not incremented, so call AddRef:
+°~StdCall({{{V:VarToObject}} + 4})({V:VarToObject})
+°EndIf
+°EndFunc
+
+Function WinDpi(hwnd As Long) As Long Naked
+  Static Long pfnGetDpiForWindow =  GetProcAddress(GetModuleHandle("user32.dll"), "GetDpiForWindow")
+  If pfnGetDpiForWindow
+    WinDpi = StdCall(pfnGetDpiForWindow)(hwnd)
+  Else    ' OS < 8.1
+    ' In a system with multiple display monitors, this value is
+    ' the DPI of mainscreen and is the same for all monitors.
+    Local Handle hdc = GetDC(hwnd)
+    WinDpi = GetDeviceCaps(hdc, LOGPIXELSX)  ' pixels per inch
+    ~ReleaseDC(hwnd, hdc)
+  EndIf
+EndFunc
+
+FunctionVar Ansi(W$$) As String Naked       ' Reverse of Wide()
+
+  ' Use a Variant as a container for the UNICODE string
+  Dim vntW As Variant              ' a placeholder
+  Word{V:vntW}     = VT_BSTR
+  Long{V:vntW + 8} = V:W$$         ' String layout similar to BSTR
+  Ansi             = vntW          ' Simple variant to $ assignment
+  ' Prevent destruction of the Variant:
+  Word{V:vntW}     = VT_EMPTY      ' Naked prevents destruction anyway
+
+  ' If Ansi$ ends with a null-byte (inside the String-data), the conversion
+  ' included the two terminating null-bytes of the wide-string.
+  ' Remove it to get a clean String.
+  ' To prevent unnessary string allocation we'll simply decrease
+  ' string's length value when it actually contains data.
+  ' Note - The function-name variable cannot be passed to another function,
+  '        the String functions cannot be used.
+  '
+  Dim va As Register Long, sl As Register Long
+  va = {ArrPtr(Ansi)}           ' same as V:, this works on Function-name
+  If va                         ' not Null?
+    sl = {va - 4}               ' get length
+    If  Byte{va + sl} == 0      ' endswith 0-byte?
+      {va - 4} = {va - 4} - 1   ' decrease the Len-value of the String
+    EndIf
+  EndIf
+EndFunc
+Function GetProcAddr(Modulename As String, ExpName As String) As Long
+
+  ' Try if module already loaded
+  Local hMod As Handle = GetModuleHandle(Modulename)       ' no refcount incr
+  If hMod == Null Then hMod = LoadLibrary(Modulename)      ' incr refcount
+  If hMod Then GetProcAddr = GetProcAddress(hMod, ExpName)
+EndFunc
+
+$Group "Headers"
+>Proc dcommon_h
+
+  Global Enum     DWRITE_MEASURING_MODE_NATURAL, _
+    DWRITE_MEASURING_MODE_GDI_CLASSIC, _
+    DWRITE_MEASURING_MODE_GDI_NATURAL
+
+  Global Enum /*D2D1_ALPHA_MODE*/ _
+    D2D1_ALPHA_MODE_UNKNOWN = 0, _
+    D2D1_ALPHA_MODE_PREMULTIPLIED = 1, _
+    D2D1_ALPHA_MODE_STRAIGHT = 2, D2D1_ALPHA_MODE_IGNORE = 3, _
+    D2D1_ALPHA_MODE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_PIXEL_FORMAT
+    - Long /*DXGI_FORMAT*/ format
+    - Long /*D2D1_ALPHA_MODE*/ alphaMode
+  EndType
+
+  Global Enum /*D3D_FEATURE_LEVEL*/ _
+    D3D_FEATURE_LEVEL_9_1   = 0x9100, _
+    D3D_FEATURE_LEVEL_9_2   = 0x9200, _
+    D3D_FEATURE_LEVEL_9_3   = 0x9300, _
+    D3D_FEATURE_LEVEL_10_0  = 0xa000, _
+    D3D_FEATURE_LEVEL_10_1  = 0xa100, _
+    D3D_FEATURE_LEVEL_11_0  = 0xb000, _
+    D3D_FEATURE_LEVEL_11_1  = 0xb100, _
+    D3D_FEATURE_LEVEL_12_0  = 0xc000, _
+    D3D_FEATURE_LEVEL_12_1  = 0xc100
+
+  Type D2D1_MATRIX_3X2_F
+    - Float f11, f12
+    - Float f21, f22
+    - Float f31, f32
+  EndType
+
+
+EndProc
+
+Proc d2d1_h
+
+  Global Enum D2D1_INTERPOLATION_MODE_DEFINITION_NEAREST_NEIGHBOR = 0, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_LINEAR = 1, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_CUBIC = 2, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_MULTI_SAMPLE_LINEAR = 3, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_ANISOTROPIC = 4, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_HIGH_QUALITY_CUBIC = 5, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_FANT = 6, _
+    D2D1_INTERPOLATION_MODE_DEFINITION_MIPMAP_LINEAR = 7
+
+  Global Enum  D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR = D2D1_INTERPOLATION_MODE_DEFINITION_NEAREST_NEIGHBOR, _
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR = D2D1_INTERPOLATION_MODE_DEFINITION_LINEAR //, D2D1_BITMAP_INTERPOLATION_MODE_FORCE_DWORD = 0xffffffff
+
+  Global Enum  D2D1_DRAW_TEXT_OPTIONS_NO_SNAP = 0x00000001, _
+    D2D1_DRAW_TEXT_OPTIONS_CLIP = 0x00000002, _
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT = 0x00000004, _
+    D2D1_DRAW_TEXT_OPTIONS_DISABLE_COLOR_BITMAP_SNAPPING = 0x00000008, _
+    D2D1_DRAW_TEXT_OPTIONS_NONE = 0x00000000  //, D2D1_DRAW_TEXT_OPTIONS_FORCE_DWORD = 0xffffffff
+
+  Global Enum     D2D1_GAMMA_2_2 = 0, _
+    D2D1_GAMMA_1_0 = 1  // , D2D1_GAMMA_FORCE_DWORD = 0xffffffff
+
+  Global Enum D2D1_OPACITY_MASK_CONTENT_GRAPHICS = 0, _
+    D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL = 1, _
+    D2D1_OPACITY_MASK_CONTENT_TEXT_GDI_COMPATIBLE = 2 //, D2D1_OPACITY_MASK_CONTENT_FORCE_DWORD = 0xffffffff
+
+  Global Enum D2D1_ANTIALIAS_MODE_PER_PRIMITIVE = 0, _
+    D2D1_ANTIALIAS_MODE_ALIASED = 1 //, D2D1_ANTIALIAS_MODE_FORCE_DWORD = 0xffffffff
+
+  Global Enum D2D1_TEXT_ANTIALIAS_MODE_DEFAULT = 0, _
+    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE = 1, _
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE = 2, _
+    D2D1_TEXT_ANTIALIAS_MODE_ALIASED = 3 // , D2D1_TEXT_ANTIALIAS_MODE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_SIZE_U
+    - Long width
+    - Long height
+  EndType
+
+  Type D2D1_COLOR_F      ' <=> D3DCOLORVALUE from d3dtypes.h
+    - Float r, g, b, a
+  EndType
+
+  Type D2D1_POINT_2F
+    - Float x, y
+  EndType
+
+  Type D2D1_RECT_F
+    - Float left, top, right, bottom
+  EndType
+
+  Type D2D1_SIZE_F
+    - Float width, height
+  EndType
+
+  Type D2D1_BITMAP_PROPERTIES
+    - D2D1_PIXEL_FORMAT pixelFormat
+    - Float dpiX
+    - Float dpiY
+  EndType
+
+  Type D2D1_GRADIENT_STOP
+    - Float position
+    - D2D1_COLOR_F color
+  EndType
+
+  Type D2D1_GRADIENT_STOP
+    - Float position
+    - D2D1_COLOR_F color
+  EndType
+
+  Type D2D1_BRUSH_PROPERTIES
+    - Float opacity
+    - D2D1_MATRIX_3X2_F transform
+  EndType
+
+  Global Enum D2D1_EXTEND_MODE_CLAMP = 0, _
+    D2D1_EXTEND_MODE_WRAP = 1, _
+    D2D1_EXTEND_MODE_MIRROR = 2 // , 2D1_EXTEND_MODE_FORCE_DWORD = 0xffffffff
+
+  Global Enum D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR = D2D1_INTERPOLATION_MODE_DEFINITION_NEAREST_NEIGHBOR, _
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR = D2D1_INTERPOLATION_MODE_DEFINITION_LINEAR //, D2D1_BITMAP_INTERPOLATION_MODE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_BITMAP_BRUSH_PROPERTIES
+    - Long /*D2D1_EXTEND_MODE*/ extendModeX
+    - Long /*D2D1_EXTEND_MODE*/ extendModeY
+    - Long /*D2D1_BITMAP_INTERPOLATION_MODE*/ interpolationMode
+  EndType
+
+  Type D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
+    - D2D1_POINT_2F startPoint
+    - D2D1_POINT_2F endPoint
+  EndType
+
+  Type D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
+    - D2D1_POINT_2F center
+    - D2D1_POINT_2F gradientOriginOffset
+    - Float radiusX
+    - Float radiusY
+  EndType
+
+  Type D2D1_ROUNDED_RECT
+    - D2D1_RECT_F rect
+    - Float radiusX, radiusY
+  EndType
+
+  Global Enum D2D1_LAYER_OPTIONS_NONE = 0x00000000, _
+    D2D1_LAYER_OPTIONS_INITIALIZE_FOR_CLEARTYPE = 0x00000001 //, D2D1_LAYER_OPTIONS_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_LAYER_PARAMETERS
+    - D2D1_RECT_F contentBounds
+    - Long geometricMask        ' address of object: {V:obj}
+    - Long maskAntialiasMode
+    - D2D1_MATRIX_3X2_F maskTransform
+    - Float opacity
+    - Long opacityBrush         ' address of object: {V:obj}
+    - Long layerOptions
+  EndType
+
+  Type D2D1_ELLIPSE
+    - D2D1_POINT_2F point
+    - Float radiusX, radiusY
+  EndType
+
+  Global Enum D2D1_FACTORY_TYPE_SINGLE_THREADED, _
+    D2D1_FACTORY_TYPE_MULTI_THREADED //, D2D1_FACTORY_TYPE_FORCE_DWORD = = 0xffffffff
+
+  Type D2D1_ARC_SEGMENT
+    - D2D1_POINT_2F point
+    - D2D1_SIZE_F size
+    - Float rotationAngle
+    - Long sweepDirection
+    - Long arcSize
+  EndType
+
+  Global Enum /*D2D1_SWEEP_DIRECTION*/ _
+    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE = 0, _
+    D2D1_SWEEP_DIRECTION_CLOCKWISE = 1 //, D2D1_SWEEP_DIRECTION_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_ARC_SIZE*/ _
+    D2D1_ARC_SIZE_SMALL = 0, _
+    D2D1_ARC_SIZE_LARGE = 1 //, D2D1_ARC_SIZE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_BEZIER_SEGMENT
+    - D2D1_POINT_2F point1
+    - D2D1_POINT_2F point2
+    - D2D1_POINT_2F point3
+  EndType
+
+  Type D2D1_QUADRATIC_BEZIER_SEGMENT
+    - D2D1_POINT_2F point1
+    - D2D1_POINT_2F point2
+  EndType
+
+  GUID IID_ID2D1Factory = 06152247-6f50-465a-9245-118bfd3b6007
+
+  Type ID2D1FactoryVtbl
+    - Long QueryInterface
+    - Long AddRef
+    - Long Release
+    - Long ReloadSystemMetrics
+    - Long GetDesktopDpi
+    - Long CreateRectangleGeometry
+    - Long CreateRoundedRectangleGeometry
+    - Long CreateEllipseGeometry
+    - Long CreateGeometryGroup
+    - Long CreateTransformedGeometry
+    - Long CreatePathGeometry
+    - Long CreateStrokeStyle
+    - Long CreateDrawingStateBlock
+    - Long CreateWicBitmapRenderTarget
+    - Long CreateHwndRenderTarget
+    - Long CreateDxgiSurfaceRenderTarget
+    - Long CreateDCRenderTarget
+  EndType
+
+
+  Global Enum /*D2D1_RENDER_TARGET_TYPE */ _
+    D2D1_RENDER_TARGET_TYPE_DEFAULT = 0, _
+    D2D1_RENDER_TARGET_TYPE_SOFTWARE = 1, _
+    D2D1_RENDER_TARGET_TYPE_HARDWARE = 2 //, D2D1_RENDER_TARGET_TYPE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_RENDER_TARGET_PROPERTIES
+    - Long /* D2D1_RENDER_TARGET_TYPE*/  type
+    - D2D1_PIXEL_FORMAT         pixelFormat
+    - Float                    dpiX
+    - Float                    dpiY
+    - Long /*D2D1_RENDER_TARGET_USAGE*/  usage
+    - Long /*D2D1_FEATURE_LEVEL*/        minLevel
+  EndType
+
+  Type D2D1_HWND_RENDER_TARGET_PROPERTIES
+    - Handle hwnd
+    - D2D1_SIZE_U pixelSize
+    - Long /*D2D1_PRESENT_OPTIONS*/ presentOptions
+  EndType
+
+  Global Enum /*D2D1_FEATURE_LEVEL*/ _
+    D2D1_FEATURE_LEVEL_DEFAULT = 0, _
+    D2D1_FEATURE_LEVEL_9 = D3D_FEATURE_LEVEL_9_1, _
+    D2D1_FEATURE_LEVEL_10 = D3D_FEATURE_LEVEL_10_0 //, D2D1_FEATURE_LEVEL_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_RENDER_TARGET_USAGE*/ _
+    D2D1_RENDER_TARGET_USAGE_NONE = 0x00000000, _
+    D2D1_RENDER_TARGET_USAGE_FORCE_BITMAP_REMOTING = 0x00000001, _
+    D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE = 0x00000002 //, D2D1_RENDER_TARGET_USAGE_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_PRESENT_OPTIONS*/ _
+    D2D1_PRESENT_OPTIONS_NONE = 0x00000000, _
+    D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS = 0x00000001, _
+    D2D1_PRESENT_OPTIONS_IMMEDIATELY = 0x00000002 //, D2D1_PRESENT_OPTIONS_FORCE_DWORD = 0xffffffff
+
+  GUID IID_ID2D1Resource = 2cd90691-12e2-11dc-9fed-001143a055f9
+  Type ID2D1ResourceVtbl
+    - Long QueryInterface
+    - Long AddRef
+    - Long Release
+    - Long GetFactory
+  EndType
+
+  Global Enum /*D2D1_CAP_STYLE*/ _
+    D2D1_CAP_STYLE_FLAT = 0, _
+    D2D1_CAP_STYLE_SQUARE = 1, _
+    D2D1_CAP_STYLE_ROUND = 2, _
+    D2D1_CAP_STYLE_TRIANGLE = 3 //, D2D1_CAP_STYLE_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_DASH_STYLE*/ _
+    D2D1_DASH_STYLE_SOLID = 0, _
+    D2D1_DASH_STYLE_DASH = 1, _
+    D2D1_DASH_STYLE_DOT = 2, _
+    D2D1_DASH_STYLE_DASH_DOT = 3, _
+    D2D1_DASH_STYLE_DASH_DOT_DOT = 4, _
+    D2D1_DASH_STYLE_CUSTOM = 5 //, D2D1_DASH_STYLE_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_LINE_JOIN*/ _
+    D2D1_LINE_JOIN_MITER = 0, _
+    D2D1_LINE_JOIN_BEVEL = 1, _
+    D2D1_LINE_JOIN_ROUND = 2, _
+    D2D1_LINE_JOIN_MITER_OR_BEVEL = 3 //, D2D1_LINE_JOIN_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_FIGURE_BEGIN*/ _
+    D2D1_FIGURE_BEGIN_FILLED = 0, _
+    D2D1_FIGURE_BEGIN_HOLLOW = 1 //, D2D1_FIGURE_BEGIN_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_FIGURE_END*/ _
+    D2D1_FIGURE_END_OPEN = 0, _
+    D2D1_FIGURE_END_CLOSED = 1 //, D2D1_FIGURE_END_FORCE_DWORD = 0xffffffff
+
+  Global Enum /*D2D1_FILL_MODE*/ _
+    D2D1_FILL_MODE_ALTERNATE = 0, _
+    D2D1_FILL_MODE_WINDING = 1 //, D2D1_FILL_MODE_FORCE_DWORD = 0xffffffff
+
+  Type D2D1_STROKE_STYLE_PROPERTIES
+    - Long /*D2D1_CAP_STYLE*/ startCap
+    - Long /*D2D1_CAP_STYLE*/ endCap
+    - Long /*D2D1_CAP_STYLE*/ dashCap
+    - Long /*D2D1_LINE_JOIN*/ lineJoin
+    - Float miterLimit
+    - Long /*D2D1_DASH_STYLE*/ dashStyle
+    - Float dashOffset
+  EndType
+
+  GUID IID_ID2D1StrokeStyle = 2cd9069d-12e2-11dc-9fed-001143a055f9
+  Type ID2D1StrokeStyleVtbl
+    - Long QueryInterface, AddRef, Release, GetFactory
+    - Long GetStartCap, GetEndCap, GetDashCap, GetMiterLimit, GetLineJoin, GetDashOffset, _
+      GetDashStyle, GetDashesCount, GetDashes
+  EndType
+
+  Global Enum D2D1_WINDOW_STATE_NONE = 0x0000000, _
+    D2D1_WINDOW_STATE_OCCLUDED = 0x0000001 //, D2D1_WINDOW_STATE_FORCE_DWORD = 0xffffffff
+
+  GUID IID_ID2D1RenderTarget = 2cd90694-12e2-11dc-9fed-001143a055f9
+  Type ID2D1RenderTargetVtbl // inherits from ID2D1Resource
+    - Long QueryInterface, AddRef, Release, GetFactory
+    - Long CreateBitmap
+    - Long CreateBitmapFromWicBitmap
+    - Long CreateSharedBitmap
+    - Long CreateBitmapBrush
+    - Long CreateSolidColorBrush
+    - Long CreateGradientStopCollection
+    - Long CreateLinearGradientBrush
+    - Long CreateRadialGradientBrush
+    - Long CreateCompatibleRenderTarget
+    - Long CreateLayer
+    - Long CreateMesh
+    - Long DrawLine
+    - Long DrawRectangle
+    - Long FillRectangle
+    - Long DrawRoundedRectangle
+    - Long FillRoundedRectangle
+    - Long DrawEllipse
+    - Long FillEllipse
+    - Long DrawGeometry
+    - Long FillGeometry
+    - Long FillMesh
+    - Long FillOpacityMask
+    - Long DrawBitmap
+    - Long DrawText
+    - Long DrawTextLayout
+    - Long DrawGlyphRun
+    - Long SetTransform
+    - Long GetTransform
+    - Long SetAntialiasMode
+    - Long GetAntialiasMode
+    - Long SetTextAntialiasMode
+    - Long GetTextAntialiasMode
+    - Long SetTextRenderingParams
+    - Long GetTextRenderingParams
+    - Long SetTags
+    - Long GetTags
+    - Long PushLayer
+    - Long PopLayer
+    - Long Flush
+    - Long SaveDrawingState
+    - Long RestoreDrawingState
+    - Long PushAxisAlignedClip
+    - Long PopAxisAlignedClip
+    - Long Clear
+    - Long BeginDraw
+    - Long EndDraw
+    - Long GetPixelFormat
+    - Long SetDpi
+    - Long GetDpi
+    - Long GetSize
+    - Long GetPixelSize
+    - Long GetMaximumBitmapSize
+    - Long IsSupported
+  EndType
+
+  GUID IID_ID2D1HwndRenderTarget = 2cd90698-12e2-11dc-9fed-001143a055f9
+  Type ID2D1HwndRenderTargetVtbl   // inherits from ID2D1RenderTarget
+    RT As ID2D1RenderTargetVtbl
+    - Long CheckWindowState   // start
+    - Long Resize
+    - Long GetHwnd
+  EndType
+
+  GUID IID_ID2D1DCRenderTarget = 1c51bc64-de61-46fd-9899-63a5d8f03950
+  Type ID2D1DCRenderTargetVtbl   // inherits from ID2D1RenderTarget
+    RT As ID2D1RenderTargetVtbl
+    - Long BindDC
+  EndType
+
+  GUID IID_ID2D1Brush = 2cd906a8-12e2-11dc-9fed-001143a055f9
+  Type ID2D1BrushVtbl    // inherits from ID2D1Resource
+    - Long QueryInterface, AddRef, Release, GetFactory
+    - Long SetOpacity, SetTransform, GetOpacity, GetTransform
+  EndType
+
+  GUID IID_ID2D1SolidColorBrush = 2cd906a9-12e2-11dc-9fed-001143a055f9
+  Type ID2D1SolidColorBrushVtbl   // inherits from ID2D1Brush
+    - Long QueryInterface, AddRef, Release, GetFactory
+    - Long SetOpacity, SetTransform, GetOpacity, GetTransform
+    - Long SetColor, GetColor
+  EndType
+
+  GUID IID_ID2D1Bitmap = a2296057-ea42-4099-983b-539fb6505426
+  Type ID2D1BitmapVtbl   // inherits from ID2D1Resource
+    - Long QueryInterface, AddRef, Release, GetFactory
+    - Long GetSize, GetPixelSize, GetPixelFormat, GetDpi, _
+      CopyFromBitmap, CopyFromRenderTarget, CopyFromMemory
+  EndType
+
+  ' ID2D1Geometry interfaces
+  '
+  GUID IID_ID2D1Geometry = 2cd906a1-12e2-11dc-9fed-001143a055f9
+  Type ID2D1GeometryVtbl
+    - Long QueryInterface, AddRef, Release, GetFactory  // inherits from ID2D1Resource
+    - Long GetBounds, GetWidenedBounds, StrokeContainsPoint, FillContainsPoint, CompareWithGeometry, _
+      Simplify, Tessellate, CombineWithGeometry, Outline, ComputeArea, ComputeLength, ComputePointAtLength, _
+      Widen
+  EndType
+
+  GUID IID_ID2D1RectangleGeometry = 2cd906a2-12e2-11dc-9fed-001143a055f9
+  Type ID2D1RectangleGeometryVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long GetRect
+  EndType
+
+  GUID IID_ID2D1RoundedRectangleGeometry = 2cd906a3-12e2-11dc-9fed-001143a055f9
+  Type ID2D1RoundedRectangleGeometryVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long GetRoundedRect
+  EndType
+
+  GUID IID_ID2D1EllipseGeometry = 2cd906a4-12e2-11dc-9fed-001143a055f9
+  Type ID2D1EllipseGeometryVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long GetEllipse
+  EndType
+
+  GUID IID_ID2D1GeometryGroup = 2cd906a6-12e2-11dc-9fed-001143a055f9
+  Type ID2D1GeometryGroupVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long GetFillMode, GetSourceGeometryCount, GetSourceGeometries
+  EndType
+
+  GUID IID_ID2D1TransformedGeometry = 2cd906bb-12e2-11dc-9fed-001143a055f9
+  Type ID2D1TransformedGeometryVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long GetSourceGeometry, GetTransForm
+  EndType
+
+  GUID IID_ID2D1PathGeometry = 2cd906a5-12e2-11dc-9fed-001143a055f9
+  Type ID2D1PathGeometryVtbl
+    Geometry As ID2D1GeometryVtbl       // inherits from ID2D1Geometry
+    - Long Open, Stream, GetSegmentCount, GetFigureCount
+  EndType
+
+  GUID IID_ID2D1SimplifiedGeometrySink = 2cd9069e-12e2-11dc-9fed-001143a055f9
+'##B#
+  Type ID2D1SimplifiedGeometrySinkVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long SetFillMode, SetSegmentFlags, BeginFigure, AddLines, AddBeziers, EndFigure, Close
+  EndType
+
+  Global Enum /*D2D1_PATH_SEGMENT*/ _
+    D2D1_PATH_SEGMENT_NONE = 0x00000000, _
+    D2D1_PATH_SEGMENT_FORCE_UNSTROKED = 0x00000001, _
+    D2D1_PATH_SEGMENT_FORCE_ROUND_LINE_JOIN = 0x00000002 //, D2D1_PATH_SEGMENT_FORCE_DWORD = 0xffffffff
+
+  GUID IID_ID2D1GeometrySink = 2cd9069f-12e2-11dc-9fed-001143a055f9
+  Type ID2D1GeometrySinkVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long SetFillMode, SetSegmentFlags, BeginFigure, AddLines, AddBeziers, EndFigure, Close
+    - Long AddLine, AddBezier, AddQuadraticBezier, AddQuadraticBeziers, AddArc
+  EndType
+
+  Declare Sub D2D1MakeRotateMatrix Lib "d2d1.dll" (ByVal angle As Float, ByVal point2f_x As Float, _
+    ByVal point2f_y As Float, ByRef matrix As D2D1_MATRIX_3X2_F)
+
+  Declare Sub D2D1MakeSkewMatrix Lib "d2d1.dll" (ByVal angleX As Float, ByVal angleY As Float, _
+    ByVal point2f_x As Float, ByVal point2f_y As Float, ByRef matrix As D2D1_MATRIX_3X2_F)
+
+  Declare Function D2D1IsMatrixInvertible Lib "d2d1.dll" (ByRef matrix As D2D1_MATRIX_3X2_F) As Long
+
+  Declare Function D2D1InvertMatrix Lib "d2d1.dll" (ByRef matrix As D2D1_MATRIX_3X2_F) As Long
+
+EndProc
+>Proc dwrite_h
+
+  Global Enum DWRITE_FACTORY_TYPE_SHARED, DWRITE_FACTORY_TYPE_ISOLATED
+
+  Global Enum     DWRITE_FONT_WEIGHT_THIN = 100, _
+    DWRITE_FONT_WEIGHT_EXTRA_LIGHT = 200, _
+    DWRITE_FONT_WEIGHT_ULTRA_LIGHT = 200, _
+    DWRITE_FONT_WEIGHT_LIGHT = 300, _
+    DWRITE_FONT_WEIGHT_SEMI_LIGHT = 350, _
+    DWRITE_FONT_WEIGHT_NORMAL = 400, _
+    DWRITE_FONT_WEIGHT_REGULAR = 400, _
+    DWRITE_FONT_WEIGHT_MEDIUM = 500, _
+    DWRITE_FONT_WEIGHT_DEMI_BOLD = 600, _
+    DWRITE_FONT_WEIGHT_SEMI_BOLD = 600, _
+    DWRITE_FONT_WEIGHT_BOLD = 700, _
+    DWRITE_FONT_WEIGHT_EXTRA_BOLD = 800, _
+    DWRITE_FONT_WEIGHT_ULTRA_BOLD = 800, _
+    DWRITE_FONT_WEIGHT_BLACK = 900, _
+    DWRITE_FONT_WEIGHT_HEAVY = 900, _
+    DWRITE_FONT_WEIGHT_EXTRA_BLACK = 950, _
+    DWRITE_FONT_WEIGHT_ULTRA_BLACK = 950
+
+  Global Enum     DWRITE_FONT_STRETCH_UNDEFINED = 0, _
+    DWRITE_FONT_STRETCH_ULTRA_CONDENSED = 1, _
+    DWRITE_FONT_STRETCH_EXTRA_CONDENSED = 2, _
+    DWRITE_FONT_STRETCH_CONDENSED = 3, _
+    DWRITE_FONT_STRETCH_SEMI_CONDENSED = 4, _
+    DWRITE_FONT_STRETCH_NORMAL = 5, _
+    DWRITE_FONT_STRETCH_MEDIUM = 5, _
+    DWRITE_FONT_STRETCH_SEMI_EXPANDED = 6, _
+    DWRITE_FONT_STRETCH_EXPANDED = 7, _
+    DWRITE_FONT_STRETCH_EXTRA_EXPANDED = 8, _
+    DWRITE_FONT_STRETCH_ULTRA_EXPANDED = 9
+
+  Global Enum DWRITE_FONT_STYLE_NORMAL, _
+    DWRITE_FONT_STYLE_OBLIQUE, _
+    DWRITE_FONT_STYLE_ITALIC
+
+  Global Enum    DWRITE_TEXT_ALIGNMENT_LEADING, _
+    DWRITE_TEXT_ALIGNMENT_TRAILING, _
+    DWRITE_TEXT_ALIGNMENT_CENTER, _
+    DWRITE_TEXT_ALIGNMENT_JUSTIFIED
+
+  Global Enum     DWRITE_READING_DIRECTION_LEFT_TO_RIGHT = 0, _
+    DWRITE_READING_DIRECTION_RIGHT_TO_LEFT = 1, _
+    DWRITE_READING_DIRECTION_TOP_TO_BOTTOM = 2, _
+    DWRITE_READING_DIRECTION_BOTTOM_TO_TOP = 3
+
+  Global Enum     DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM = 0, _
+    DWRITE_FLOW_DIRECTION_BOTTOM_TO_TOP = 1, _
+    DWRITE_FLOW_DIRECTION_LEFT_TO_RIGHT = 2, _
+    DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT = 3
+
+  Global Enum     DWRITE_PARAGRAPH_ALIGNMENT_NEAR, _
+    DWRITE_PARAGRAPH_ALIGNMENT_FAR, _
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+
+  Global Enum    DWRITE_WORD_WRAPPING_WRAP = 0, _
+    DWRITE_WORD_WRAPPING_NO_WRAP = 1, _
+    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK = 2, _
+    DWRITE_WORD_WRAPPING_WHOLE_WORD = 3, _
+    DWRITE_WORD_WRAPPING_CHARACTER = 4
+
+  Global Enum   DWRITE_LINE_SPACING_METHOD_DEFAULT, _
+    DWRITE_LINE_SPACING_METHOD_UNIFORM, _
+    DWRITE_LINE_SPACING_METHOD_PROPORTIONAL
+
+  Global Enum    DWRITE_TRIMMING_GRANULARITY_NONE, _
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, _
+    DWRITE_TRIMMING_GRANULARITY_WORD
+
+  Type DWRITE_TEXT_RANGE
+    - Long startPosition, length
+  EndType
+
+  Type DWRITE_TRIMMING
+    - Long granularity
+    - Long delimiter
+    - Long delimiterCount
+  EndType
+
+  GUID IID_IDWriteTextFormat = 9c906818-31d7-4fd3-a151-7c5e225db55a
+  Type IDWriteTextFormatVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetReadingDirection, _
+      SetFlowDirection, SetIncrementalTabStop, SetTrimming, SetLineSpacing, GetTextAlignment, _
+      GetParagraphAlignment, GetWordWrapping, GetReadingDirection, GetFlowDirection, _
+      GetIncrementalTabStop, GetTrimming, GetLineSpacing, GetFontCollection, _
+      GetFontFamilyNameLength, GetFontFamilyName, GetFontWeight, GetFontStyle, GetFontStretch, _
+      GetFontSize, GetLocaleNameLength, GetLocaleName
+  EndType
+
+  GUID IID_IDWriteTextLayout = 53737037-6d14-410b-9bfe-0b182bb70961
+  Type IDWriteTextLayoutVtbl
+    TF As IDWriteTextFormatVtbl   // inherits
+    - Long SetMaxWidth, SetMaxHeight, SetFontCollection, SetFontFamilyName, _
+      SetFontWeight, SetFontStyle, SetFontStretch, SetFontSize, SetUnderline, _
+      SetStrikethrough, SetDrawingEffect, SetInlineObject, SetTypography, _
+      SetLocaleName, GetMaxWidth, GetMaxHeight, GetFontCollection,  _
+      GetFontFamilyNameLength, GetFontFamilyName, GetFontWeight, GetFontStyle, _
+      GetFontStretch, GetFontSize, GetUnderline, GetStrikethrough, GetDrawingEffect, _
+      GetInlineObject, GetTypography, GetLocaleNameLength, GetLocaleName, _
+      Draw, GetLineMetrics, GetMetrics, GetOverhangMetrics, GetClusterMetrics, _
+      DetermineMinWidth, HitTestPoint, HitTestTextPosition, HitTestTextRange
+  EndType
+
+  Type DWRITE_GLYPH_OFFSET
+    - Float advanceOffset
+    - Float ascenderOffset
+  EndType
+
+  Type DWRITE_GLYPH_RUN
+    - Long fontFace     ' address of IDWriteFontFace object
+    - Float fontEmSize
+    - Int32 glyphCount
+    - Long glyphIndices         ' address of Card array(?)
+    - Long glyphAdvances        ' address of float array(?)
+    - Long glyphOffsets         ' address of DWRITE_GLYPH_OFFSET
+    - Long isSideways
+    - Int32 bidiLevel
+  EndType
+
+  Type DWRITE_TEXT_METRICS
+    - Float left, top, width, widthIncludingTrailingWhitespace, height
+    - Float layoutWidth, layoutHeight
+    - Long maxBidiReorderingDepth, lineCount
+  EndType
+
+  Type DWRITE_HIT_TEST_METRICS
+    - Int32 textPosition
+    - Int32 length
+    - Float left
+    - Float top
+    - Float width
+    - Float height
+    - Int32 bidiLevel
+    - Long isText
+    - Long isTrimmed
+  EndType
+
+  Type DWRITE_LINE_METRICS
+    -Int32 length
+    - Int32 trailingWhitespaceLength
+    - Int32 newlineLength
+    - Float height
+    - Float baseline
+    - Long isTrimmed
+  EndType
+
+  Type DWRITE_CLUSTER_METRICS
+    - Float  width
+    - Card length
+    canWrapLineAfter As Bits 1
+    isWhitespace As Bits 1
+    isNewline As Bits 1
+    isSoftHyphen As Bits 1
+    isRightToLeft As Bits 1
+    padding As Bits 11
+  EndType
+
+  GUID IID_IDWriteFactory = b859ee5a-d838-4b5b-a2e8-1adc7d93db48
+  Type IDWriteFactoryVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long GetSystemFontCollection, CreateCustomFontCollection, RegisterFontCollectionLoader, _
+      UnregisterFontCollectionLoader, CreateFontFileReference, CreateCustomFontFileReference, _
+      CreateFontFace, CreateRenderingParams, CreateMonitorRenderingParams, _
+      CreateCustomRenderingParams, RegisterFontFileLoader, UnregisterFontFileLoader, _
+      CreateTextFormat, CreateTypography, GetGdiInterop, CreateTextLayout, _
+      CreateGdiCompatibleTextLayout, CreateEllipsisTrimmingSign, CreateTextAnalyzer, _
+      CreateNumberSubstitution, CreateGlyphRunAnalysis
+  EndType
+
+EndProc
+
+>Proc d2derr_h
+  Global Const D2DERR_BAD_NUMBER = 0x88990011
+  Global Const D2DERR_BITMAP_BOUND_AS_TARGET = 0x88990025
+  Global Const D2DERR_BITMAP_CANNOT_DRAW =   0x88990021
+  Global Const D2DERR_CYCLIC_GRAPH = 0x88990020
+  Global Const D2DERR_DISPLAY_FORMAT_NOT_SUPPORTED = 0x88990009
+  Global Const D2DERR_DISPLAY_STATE_INVALID = 0x88990006
+  Global Const D2DERR_EFFECT_IS_NOT_REGISTERED = 0x88990028
+  Global Const D2DERR_EXCEEDS_MAX_BITMAP_SIZE = 0x8899001D
+  Global Const D2DERR_INCOMPATIBLE_BRUSH_TYPES = 0x88990018
+  Global Const D2DERR_INSUFFICIENT_DEVICE_CAPABILITIES = 0x88990026
+  Global Const D2DERR_INTERMEDIATE_TOO_LARGE = 0x88990027
+  Global Const D2DERR_INTERNAL_ERROR = 0x88990008
+  Global Const D2DERR_INVALID_CALL = 0x8899000A
+  Global Const D2DERR_INVALID_GRAPH_CONFIGURATION = 0x8899001E
+  Global Const D2DERR_INVALID_INTERNAL_GRAPH_CONFIGURATION = 0x8899001F
+  Global Const D2DERR_INVALID_PROPERTY = 0x88990029
+  Global Const D2DERR_INVALID_TARGET = 0x88990024
+  Global Const D2DERR_LAYER_ALREADY_IN_USE = 0x88990013
+  Global Const D2DERR_MAX_TEXTURE_SIZE_EXCEEDED = 0x8899000F
+  Global Const D2DERR_NO_HARDWARE_DEVICE = 0x8899000B
+  Global Const D2DERR_NO_SUBPROPERTIES = 0x8899002A
+  Global Const D2DERR_NOT_INITIALIZED = 0x88990002
+  Global Const D2DERR_ORIGINAL_TARGET_NOT_BOUND = 0x88990023
+  Global Const D2DERR_OUTSTANDING_BITMAP_REFERENCES = 0x88990022
+  Global Const D2DERR_POP_CALL_DID_NOT_MATCH_PUSH = 0x88990014
+  Global Const D2DERR_PRINT_FORMAT_NOT_SUPPORTED = 0x8899002C
+  Global Const D2DERR_PRINT_JOB_CLOSED = 0x8899002B
+  Global Const D2DERR_PUSH_POP_UNBALANCED = 0x88990016
+  Global Const D2DERR_RECREATE_TARGET = 0x8899000C
+  Global Const D2DERR_RENDER_TARGET_HAS_LAYER_OR_CLIPRECT = 0x88990017
+  Global Const D2DERR_SCANNER_FAILED = 0x88990004
+  Global Const D2DERR_SCREEN_ACCESS_DENIED = 0x88990005
+  Global Const D2DERR_SHADER_COMPILE_FAILED = 0x8899000E
+  Global Const D2DERR_TARGET_NOT_GDI_COMPATIBLE = 0x8899001A
+  Global Const D2DERR_TEXT_EFFECT_IS_WRONG_TYPE = 0x8899001B
+  Global Const D2DERR_TEXT_RENDERER_NOT_RELEASED = 0x8899001C
+  Global Const D2DERR_TOO_MANY_SHADER_ELEMENTS = 0x8899000D
+  Global Const D2DERR_TOO_MANY_TRANSFORM_INPUTS = 0x8899002D
+  Global Const D2DERR_UNSUPPORTED_OPERATION = 0x88990003
+  Global Const D2DERR_UNSUPPORTED_VERSION = 0x88990010
+  Global Const D2DERR_WIN32_ERROR = 0x88990019
+  Global Const D2DERR_WRONG_FACTORY = 0x88990012
+  Global Const D2DERR_WRONG_FACTORY = 0x88990012
+  Global Const D2DERR_WRONG_STATE = 0x88990001
+  Global Const D2DERR_ZERO_VECTOR = 0x88990007
+
+EndProc
+
+>Proc d2d1helper_h
+
+  Global Enum D2C_AliceBlue = 0xF0F8FF, _
+    D2C_AntiqueWhite = 0xFAEBD7,  _
+    D2C_Aqua = 0x00FFFF, _
+    D2C_Aquamarine = 0x7FFFD4, _
+    D2C_Azure = 0xF0FFFF, _
+    D2C_Beige = 0xF5F5DC, _
+    D2C_Bisque = 0xFFE4C4, _
+    D2C_Black = 0x000000, _
+    D2C_BlanchedAlmond = 0xFFEBCD, _
+    D2C_Blue = 0x0000FF, _
+    D2C_BlueViolet = 0x8A2BE2, _
+    D2C_Brown = 0xA52A2A, _
+    D2C_BurlyWood = 0xDEB887, _
+    D2C_CadetBlue = 0x5F9EA0, _
+    D2C_Chartreuse = 0x7FFF00, _
+    D2C_Chocolate = 0xD2691E, _
+    D2C_Coral = 0xFF7F50, _
+    D2C_CornflowerBlue = 0x6495ED, _
+    D2C_Cornsilk = 0xFFF8DC, _
+    D2C_Crimson = 0xDC143C, _
+    D2C_Cyan = 0x00FFFF, _
+    D2C_DarkBlue = 0x00008B, _
+    D2C_DarkCyan = 0x008B8B, _
+    D2C_DarkGoldenrod = 0xB8860B, _
+    D2C_DarkGray = 0xA9A9A9, _
+    D2C_DarkGreen = 0x006400, _
+    D2C_DarkKhaki = 0xBDB76B, _
+    D2C_DarkMagenta = 0x8B008B, _
+    D2C_DarkOliveGreen = 0x556B2F, _
+    D2C_DarkOrange = 0xFF8C00, _
+    D2C_DarkOrchid = 0x9932CC, _
+    D2C_DarkRed = 0x8B0000, _
+    D2C_DarkSalmon = 0xE9967A, _
+    D2C_DarkSeaGreen = 0x8FBC8F, _
+    D2C_DarkSlateBlue = 0x483D8B, _
+    D2C_DarkSlateGray = 0x2F4F4F, _
+    D2C_DarkTurquoise = 0x00CED1, _
+    D2C_DarkViolet = 0x9400D3, _
+    D2C_DeepPink = 0xFF1493, _
+    D2C_DeepSkyBlue = 0x00BFFF, _
+    D2C_DimGray = 0x696969, _
+    D2C_DodgerBlue = 0x1E90FF, _
+    D2C_Firebrick = 0xB22222, _
+    D2C_FloralWhite = 0xFFFAF0, _
+    D2C_ForestGreen = 0x228B22, _
+    D2C_Fuchsia = 0xFF00FF, _
+    D2C_Gainsboro = 0xDCDCDC, _
+    D2C_GhostWhite = 0xF8F8FF, _
+    D2C_Gold = 0xFFD700, _
+    D2C_Goldenrod = 0xDAA520, _
+    D2C_Gray = 0x808080, _
+    D2C_Green = 0x008000, _
+    D2C_GreenYellow = 0xADFF2F, _
+    D2C_Honeydew = 0xF0FFF0, _
+    D2C_HotPink = 0xFF69B4, _
+    D2C_IndianRed = 0xCD5C5C, _
+    D2C_Indigo = 0x4B0082, _
+    D2C_Ivory = 0xFFFFF0, _
+    D2C_Khaki = 0xF0E68C, _
+    D2C_Lavender = 0xE6E6FA, _
+    D2C_LavenderBlush = 0xFFF0F5, _
+    D2C_LawnGreen = 0x7CFC00, _
+    D2C_LemonChiffon = 0xFFFACD, _
+    D2C_LightBlue = 0xADD8E6, _
+    D2C_LightCoral = 0xF08080, _
+    D2C_LightCyan = 0xE0FFFF, _
+    D2C_LightGoldenrodYellow = 0xFAFAD2, _
+    D2C_LightGreen = 0x90EE90, _
+    D2C_LightGray = 0xD3D3D3, _
+    D2C_LightPink = 0xFFB6C1, _
+    D2C_LightSalmon = 0xFFA07A, _
+    D2C_LightSeaGreen = 0x20B2AA, _
+    D2C_LightSkyBlue = 0x87CEFA, _
+    D2C_LightSlateGray = 0x778899, _
+    D2C_LightSteelBlue = 0xB0C4DE, _
+    D2C_LightYellow = 0xFFFFE0, _
+    D2C_Lime = 0x00FF00, _
+    D2C_LimeGreen = 0x32CD32, _
+    D2C_Linen = 0xFAF0E6, _
+    D2C_Magenta = 0xFF00FF, _
+    D2C_Maroon = 0x800000, _
+    D2C_MediumAquamarine = 0x66CDAA, _
+    D2C_MediumBlue = 0x0000CD, _
+    D2C_MediumOrchid = 0xBA55D3, _
+    D2C_MediumPurple = 0x9370DB, _
+    D2C_MediumSeaGreen = 0x3CB371, _
+    D2C_MediumSlateBlue = 0x7B68EE, _
+    D2C_MediumSpringGreen = 0x00FA9A, _
+    D2C_MediumTurquoise = 0x48D1CC, _
+    D2C_MediumVioletRed = 0xC71585, _
+    D2C_MidnightBlue = 0x191970, _
+    D2C_MintCream = 0xF5FFFA, _
+    D2C_MistyRose = 0xFFE4E1, _
+    D2C_Moccasin = 0xFFE4B5, _
+    D2C_NavajoWhite = 0xFFDEAD, _
+    D2C_Navy = 0x000080, _
+    D2C_OldLace = 0xFDF5E6, _
+    D2C_Olive = 0x808000, _
+    D2C_OliveDrab = 0x6B8E23, _
+    D2C_Orange = 0xFFA500, _
+    D2C_OrangeRed = 0xFF4500, _
+    D2C_Orchid = 0xDA70D6, _
+    D2C_PaleGoldenrod = 0xEEE8AA, _
+    D2C_PaleGreen = 0x98FB98, _
+    D2C_PaleTurquoise = 0xAFEEEE, _
+    D2C_PaleVioletRed = 0xDB7093, _
+    D2C_PapayaWhip = 0xFFEFD5, _
+    D2C_PeachPuff = 0xFFDAB9, _
+    D2C_Peru = 0xCD853F, _
+    D2C_Pink = 0xFFC0CB, _
+    D2C_Plum = 0xDDA0DD, _
+    D2C_PowderBlue = 0xB0E0E6, _
+    D2C_Purple = 0x800080, _
+    D2C_Red = 0xFF0000, _
+    D2C_RosyBrown = 0xBC8F8F, _
+    D2C_RoyalBlue = 0x4169E1, _
+    D2C_SaddleBrown = 0x8B4513, _
+    D2C_Salmon = 0xFA8072, _
+    D2C_SandyBrown = 0xF4A460, _
+    D2C_SeaGreen = 0x2E8B57, _
+    D2C_SeaShell = 0xFFF5EE, _
+    D2C_Sienna = 0xA0522D, _
+    D2C_Silver = 0xC0C0C0, _
+    D2C_SkyBlue = 0x87CEEB, _
+    D2C_SlateBlue = 0x6A5ACD, _
+    D2C_SlateGray = 0x708090, _
+    D2C_Snow = 0xFFFAFA, _
+    D2C_SpringGreen = 0x00FF7F, _
+    D2C_SteelBlue = 0x4682B4, _
+    D2C_Tan = 0xD2B48C, _
+    D2C_Teal = 0x008080, _
+    D2C_Thistle = 0xD8BFD8, _
+    D2C_Tomato = 0xFF6347, _
+    D2C_Turquoise = 0x40E0D0, _
+    D2C_Violet = 0xEE82EE, _
+    D2C_Wheat = 0xF5DEB3, _
+    D2C_White = 0xFFFFFF, _
+    D2C_WhiteSmoke = 0xF5F5F5, _
+    D2C_Yellow = 0xFFFF00, _
+    D2C_YellowGreen = 0x9ACD32
+EndProc
+
+>Proc dxgiformat_h
+  Global Enum /*DXGI_FORMAT*/ _
+    DXGI_FORMAT_UNKNOWN, _
+    DXGI_FORMAT_R32G32B32A32_TYPELESS, _
+    DXGI_FORMAT_R32G32B32A32_FLOAT, _
+    DXGI_FORMAT_R32G32B32A32_UINT, _
+    DXGI_FORMAT_R32G32B32A32_SINT, _
+    DXGI_FORMAT_R32G32B32_TYPELESS, _
+    DXGI_FORMAT_R32G32B32_FLOAT, _
+    DXGI_FORMAT_R32G32B32_UINT, _
+    DXGI_FORMAT_R32G32B32_SINT, _
+    DXGI_FORMAT_R16G16B16A16_TYPELESS, _
+    DXGI_FORMAT_R16G16B16A16_FLOAT, _
+    DXGI_FORMAT_R16G16B16A16_UNORM, _
+    DXGI_FORMAT_R16G16B16A16_UINT, _
+    DXGI_FORMAT_R16G16B16A16_SNORM, _
+    DXGI_FORMAT_R16G16B16A16_SINT, _
+    DXGI_FORMAT_R32G32_TYPELESS, _
+    DXGI_FORMAT_R32G32_FLOAT, _
+    DXGI_FORMAT_R32G32_UINT, _
+    DXGI_FORMAT_R32G32_SINT, _
+    DXGI_FORMAT_R32G8X24_TYPELESS, _
+    DXGI_FORMAT_D32_FLOAT_S8X24_UINT, _
+    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, _
+    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, _
+    DXGI_FORMAT_R10G10B10A2_TYPELESS, _
+    DXGI_FORMAT_R10G10B10A2_UNORM, _
+    DXGI_FORMAT_R10G10B10A2_UINT, _
+    DXGI_FORMAT_R11G11B10_FLOAT, _
+    DXGI_FORMAT_R8G8B8A8_TYPELESS, _
+    DXGI_FORMAT_R8G8B8A8_UNORM, _
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, _
+    DXGI_FORMAT_R8G8B8A8_UINT, _
+    DXGI_FORMAT_R8G8B8A8_SNORM, _
+    DXGI_FORMAT_R8G8B8A8_SINT, _
+    DXGI_FORMAT_R16G16_TYPELESS, _
+    DXGI_FORMAT_R16G16_FLOAT, _
+    DXGI_FORMAT_R16G16_UNORM, _
+    DXGI_FORMAT_R16G16_UINT, _
+    DXGI_FORMAT_R16G16_SNORM, _
+    DXGI_FORMAT_R16G16_SINT, _
+    DXGI_FORMAT_R32_TYPELESS, _
+    DXGI_FORMAT_D32_FLOAT, _
+    DXGI_FORMAT_R32_FLOAT, _
+    DXGI_FORMAT_R32_UINT, _
+    DXGI_FORMAT_R32_SINT, _
+    DXGI_FORMAT_R24G8_TYPELESS, _
+    DXGI_FORMAT_D24_UNORM_S8_UINT, _
+    DXGI_FORMAT_R24_UNORM_X8_TYPELESS, _
+    DXGI_FORMAT_X24_TYPELESS_G8_UINT, _
+    DXGI_FORMAT_R8G8_TYPELESS, _
+    DXGI_FORMAT_R8G8_UNORM, _
+    DXGI_FORMAT_R8G8_UINT, _
+    DXGI_FORMAT_R8G8_SNORM, _
+    DXGI_FORMAT_R8G8_SINT, _
+    DXGI_FORMAT_R16_TYPELESS, _
+    DXGI_FORMAT_R16_FLOAT, _
+    DXGI_FORMAT_D16_UNORM, _
+    DXGI_FORMAT_R16_UNORM, _
+    DXGI_FORMAT_R16_UINT, _
+    DXGI_FORMAT_R16_SNORM, _
+    DXGI_FORMAT_R16_SINT, _
+    DXGI_FORMAT_R8_TYPELESS, _
+    DXGI_FORMAT_R8_UNORM, _
+    DXGI_FORMAT_R8_UINT, _
+    DXGI_FORMAT_R8_SNORM, _
+    DXGI_FORMAT_R8_SINT, _
+    DXGI_FORMAT_A8_UNORM, _
+    DXGI_FORMAT_R1_UNORM, _
+    DXGI_FORMAT_R9G9B9E5_SHAREDEXP, _
+    DXGI_FORMAT_R8G8_B8G8_UNORM, _
+    DXGI_FORMAT_G8R8_G8B8_UNORM, _
+    DXGI_FORMAT_BC1_TYPELESS, _
+    DXGI_FORMAT_BC1_UNORM, _
+    DXGI_FORMAT_BC1_UNORM_SRGB, _
+    DXGI_FORMAT_BC2_TYPELESS, _
+    DXGI_FORMAT_BC2_UNORM, _
+    DXGI_FORMAT_BC2_UNORM_SRGB, _
+    DXGI_FORMAT_BC3_TYPELESS, _
+    DXGI_FORMAT_BC3_UNORM, _
+    DXGI_FORMAT_BC3_UNORM_SRGB, _
+    DXGI_FORMAT_BC4_TYPELESS, _
+    DXGI_FORMAT_BC4_UNORM, _
+    DXGI_FORMAT_BC4_SNORM, _
+    DXGI_FORMAT_BC5_TYPELESS, _
+    DXGI_FORMAT_BC5_UNORM, _
+    DXGI_FORMAT_BC5_SNORM, _
+    DXGI_FORMAT_B5G6R5_UNORM, _
+    DXGI_FORMAT_B5G5R5A1_UNORM, _
+    DXGI_FORMAT_B8G8R8A8_UNORM, _
+    DXGI_FORMAT_B8G8R8X8_UNORM, _
+    DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, _
+    DXGI_FORMAT_B8G8R8A8_TYPELESS, _
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, _
+    DXGI_FORMAT_B8G8R8X8_TYPELESS, _
+    DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, _
+    DXGI_FORMAT_BC6H_TYPELESS, _
+    DXGI_FORMAT_BC6H_UF16, _
+    DXGI_FORMAT_BC6H_SF16, _
+    DXGI_FORMAT_BC7_TYPELESS, _
+    DXGI_FORMAT_BC7_UNORM, _
+    DXGI_FORMAT_BC7_UNORM_SRGB, _
+    DXGI_FORMAT_AYUV, _
+    DXGI_FORMAT_Y410, _
+    DXGI_FORMAT_Y416, _
+    DXGI_FORMAT_NV12, _
+    DXGI_FORMAT_P010, _
+    DXGI_FORMAT_P016, _
+    DXGI_FORMAT_420_OPAQUE, _
+    DXGI_FORMAT_YUY2, _
+    DXGI_FORMAT_Y210, _
+    DXGI_FORMAT_Y216, _
+    DXGI_FORMAT_NV11, _
+    DXGI_FORMAT_AI44, _
+    DXGI_FORMAT_IA44, _
+    DXGI_FORMAT_P8, _
+    DXGI_FORMAT_A8P8, _
+    DXGI_FORMAT_B4G4R4A4_UNORM, _
+    DXGI_FORMAT_P208, _
+    DXGI_FORMAT_V208, _
+    DXGI_FORMAT_V408, _
+    DXGI_FORMAT_FORCE_UINT
+EndProc
+
+>Proc ole32_h
+  Global Const E_NOTIMPL = 0x80004001
+  Global Const E_NOINTERFACE = 0x80004002
+
+  Global Enum CLSCTX, CLSCTX_INPROC_SERVER, CLSCTX_INPROC_HANDLER = 2, _
+    CLSCTX_LOCAL_SERVER = 4, CLSCTX_REMOTE_SERVER = 16, _
+    CLSCTX_SERVER = CLSCTX_INPROC_SERVER + CLSCTX_LOCAL_SERVER + CLSCTX_REMOTE_SERVER, _
+    CLSCTX_ALL = CLSCTX_INPROC_SERVER + CLSCTX_INPROC_HANDLER + CLSCTX_LOCAL_SERVER + CLSCTX_REMOTE_SERVER
+
+
+>Proc wincodec_h
+
+  GUID GUID_WICPixelFormat32bppPBGRA = 6fddc324-4e03-4bfe-b185-3d77768dc910
+
+  Global Enum CODEC_FORCE_DWORD = 0x7FFFFFFF
+
+  Global Enum WICBitmapDitherTypeNone = 0x00000000, _
+    WICBitmapDitherTypeSolid          = 0x00000000, _
+    WICBitmapDitherTypeOrdered4x4     = 0x00000001, _
+    WICBitmapDitherTypeOrdered8x8     = 0x00000002, _
+    WICBitmapDitherTypeOrdered16x16   = 0x00000003, _
+    WICBitmapDitherTypeSpiral4x4      = 0x00000004, _
+    WICBitmapDitherTypeSpiral8x8      = 0x00000005, _
+    WICBitmapDitherTypeDualSpiral4x4  = 0x00000006, _
+    WICBitmapDitherTypeDualSpiral8x8  = 0x00000007, _
+    WICBitmapDitherTypeErrorDiffusion = 0x00000008, _
+    WICBITMAPDITHERTYPE_FORCE_DWORD   = CODEC_FORCE_DWORD
+
+  Global Enum  WICBitmapUseAlpha             = 0x00000000, _
+    WICBitmapUsePremultipliedAlpha           = 0x00000001, _
+    WICBitmapIgnoreAlpha                     = 0x00000002, _
+    WICBITMAPALPHACHANNELOPTIONS_FORCE_DWORD = CODEC_FORCE_DWORD
+
+  Global Enum WICBitmapPaletteTypeCustom           = 0x00000000, _
+    WICBitmapPaletteTypeMedianCut        = 0x00000001, _
+    WICBitmapPaletteTypeFixedBW          = 0x00000002, _
+    WICBitmapPaletteTypeFixedHalftone8   = 0x00000003, _
+    WICBitmapPaletteTypeFixedHalftone27  = 0x00000004, _
+    WICBitmapPaletteTypeFixedHalftone64  = 0x00000005, _
+    WICBitmapPaletteTypeFixedHalftone125 = 0x00000006, _
+    WICBitmapPaletteTypeFixedHalftone216 = 0x00000007, _
+    WICBitmapPaletteTypeFixedWebPalette  = WICBitmapPaletteTypeFixedHalftone216, _
+    WICBitmapPaletteTypeFixedHalftone252 = 0x00000008, _
+    WICBitmapPaletteTypeFixedHalftone256 = 0x00000009, _
+    WICBitmapPaletteTypeFixedGray4       = 0x0000000A, _
+    WICBitmapPaletteTypeFixedGray16      = 0x0000000B, _
+    WICBitmapPaletteTypeFixedGray256     = 0x0000000C, _
+    WICBITMAPPALETTETYPE_FORCE_DWORD     = CODEC_FORCE_DWORD
+
+  GUID CLSID_WICImagingFactory = cacaf262-9370-4615-a13b-9f5539da4c0a
+  GUID IID_IWICImagingFactory = ec5ec8a9-c395-4314-9c77-54d7a935ff70
+
+  Type IWICImagingFactoryVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long CreateDecoderFromFilename, CreateDecoderFromStream, CreateDecoderFromFileHandle, _
+      CreateComponentInfo, CreateDecoder, CreateEncoder, CreatePalette, CreateFormatConverter, _
+      CreateBitmapScaler, CreateBitmapClipper, CreateBitmapFlipRotator, CreateStream, _
+      CreateColorContext, CreateColorTransformer, CreateBitmap, CreateBitmapFromSource, _
+      CreateBitmapFromSourceRect, CreateBitmapFromMemory, CreateBitmapFromHBITMAP, _
+      CreateBitmapFromHICON, CreateComponentEnumerator, CreateFastMetadataEncoderFromDecoder, _
+      CreateFastMetadataEncoderFromFrameDecode, CreateQueryWriter, CreateQueryWriterFromReader
+  EndType
+
+  GUID IID_IWICBitmapSource = 00000120-a8f2-4877-ba0a-fd2b6645fb94
+  Type IWICBitmapSourceVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long GetSize, GetPixelFormat, GetResolution, CopyPalette, CopyPixels
+  EndType
+
+  GUID IID_IWICFormatConverter = 00000301-a8f2-4877-ba0a-fd2b6645fb94
+  Type IWICFormatConverterVtbl     ' inherits form IWICBitmapSource
+    - Long QueryInterface, AddRef, Release
+    - Long GetSize, GetPixelFormat, GetResolution, CopyPalette, CopyPixels, _
+      Initialize, CanConvert
+  EndType
+
+  Global Enum WICDecodeMetadataCacheOnDemand    = 0, _
+    WICDecodeMetadataCacheOnLoad    = 0x1, _
+    WICMETADATACACHEOPTION_FORCE_DWORD      = 0x7fffffff
+
+  GUID IID_IWICBitmapDecoder = 9edde9e7-8dee-47ea-99df-e6faf2ed44bf
+  Type IWICBitmapDecoderVtbl
+    - Long QueryInterface, AddRef, Release
+    - Long QueryCapability, Initialize, GetContainerFormat, GetDecoderInfo, _
+      CopyPalette, GetMetadataQueryReader, GetPreview, GetColorContexts, _
+      GetThumbnail, GetFrameCount, GetFrame
+  EndType
+$DatFile
+$FormVersion = 2
+:goldfish 9868, 10036
+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
+4+Ku/nNAAA==
+:Hatch0 85, 822B
+RBAUDtWMJBgNDQEAFBgAfASQ59j9/HjOyL4ryv2HiICF88z8ks/ZvH3/LUkodd4XERH2ISXlmREM
+SECIZBU3E064//dV8bNbp2iaLsFkbL/WwsAAAA==
+$ExeName = Direct2D.lg32
+$FileDescription = Description
+$Comments = Author: Not registered   
+$CompanyName = Not registered   
+$LegalCopyright = © 2019 Not registered   
+$LanguageId = 0409
+$FileFlags# = 2
+$FileVersion = %d.%d.%d.%d
+$ProductVersion = %d.%d.%d.%d
+$DatFile
